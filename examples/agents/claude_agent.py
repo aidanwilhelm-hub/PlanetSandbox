@@ -122,11 +122,15 @@ def main():
     parser = argparse.ArgumentParser(description="Let Claude drive an NPC in Planet Sandbox.")
     parser.add_argument("--name", default="claude")
     parser.add_argument("--persona", default="a cheerful, curious naturalist who loves meeting critters")
+    parser.add_argument("--host", default=None, help="server address (default: this computer)")
     parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument("--password", default=None,
+                        help="the server's password, if it has one (or set PLANET_PASSWORD)")
     parser.add_argument("--think-every", type=int, default=60,
                         help="ticks between decisions (20 ticks = 1 second of game time)")
     args = parser.parse_args()
-    run(make_decide(args.persona, args.name), name=args.name, port=args.port, think_every=args.think_every)
+    run(make_decide(args.persona, args.name), name=args.name, host=args.host, port=args.port,
+        password=args.password, think_every=args.think_every)
 
 
 if __name__ == "__main__":

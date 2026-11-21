@@ -1,43 +1,66 @@
-## The 3D view: draws snapshots from the server and turns your clicks and key
-## presses into commands.
+## The 3D view: draws snapshots and turns your clicks and key presses into
+## commands.
 ##
-## It never changes the simulation directly. Everything goes through
-## server.submit_command(), the same door a remote player or an AI agent
-## will use, so the view can later run on a different machine unchanged.
+## It never changes the simulation directly, and never even knows where the
+## simulation runs. Everything goes through a server link (client/server_link.gd):
+## the same code draws single player, hosting, joining someone else's game,
+## and watching an AI world.
 extends Node3D
 
 const Planet = preload("res://sim/planet.gd")
 const Commands = preload("res://sim/commands.gd")
+const Protocol = preload("res://net/protocol.gd")
 const MeshBuilder = preload("res://client/planet_mesh_builder.gd")
 const EntityVisuals = preload("res://client/entity_visuals.gd")
 const OrbitCamera = preload("res://client/orbit_camera.gd")
 const Hud = preload("res://client/hud.gd")
-const CuriousAgent = preload("res://agents/examples/curious_agent.gd")
+const SpectatorControls = preload("res://client/spectator_controls.gd")
 
-## In single-player the person at the keyboard is the admin.
-const ISSUER := Commands.ADMIN
 const CLICK_PICK_PIXELS := 22.0
 
-var server: Node
+var link: Node              ## a server link (local or remote)
 var planet: Planet          ## a local copy, rebuilt from the seed, for drawing and mouse picking
 var camera: OrbitCamera
 var sun: DirectionalLight3D
 var hud: Hud
+var spectator: SpectatorControls
 var selected_id := -1
+var follow_id := -1         ## the camera tracks this entity (-1 = free camera)
 
 var _visuals: Dictionary = {}   ## entity id -> Node3D
 var _latest: Dictionary = {}    ## entity id -> latest entity dict from the server
 var _snapshot: Dictionary = {}
 var _ring: MeshInstance3D
 var _focused_once := false
-var _agent_count := 0
+var _focus_own := true
 
 
-func setup(p_server: Node) -> void:
-	server = p_server
+func setup(p_link: Node) -> void:
+	link = p_link
 	_build_scene()
-	server.snapshot_published.connect(_on_snapshot)
-	server.publish()
+	spectator = SpectatorControls.new(self, link.role == "spectator")
+	spectator.name = "SpectatorControls"
+	add_child(spectator)
+	link.snapshot_published.connect(_on_snapshot)
+	link.notice.connect(hud.log_line)
+	link.players_changed.connect(func(_list: Array) -> void: _refresh_players())
+	link.identity_changed.connect(_on_identity_changed)
+	hud.chat_submitted.connect(_send_chat)
+	hud.kick_pressed.connect(func(id: int) -> void: link.kick(id))
+	hud.mod_toggled.connect(func(id: int, on: bool) -> void: link.set_mod(id, on))
+	hud.set_help(link)
+	_refresh_players()
+	link.publish()
+
+
+func _on_identity_changed() -> void:
+	hud.set_help(link)
+	_refresh_players()
+	_focus_own = true
+
+
+func _refresh_players() -> void:
+	hud.show_players(link.players, link.is_host, link.is_host or link.is_mod)
 
 
 func _build_scene() -> void:
@@ -111,7 +134,7 @@ func _on_snapshot(snap: Dictionary) -> void:
 			add_child(node)
 			node.position = e["position"]
 			_visuals[id] = node
-			if not _focused_once and e["kind"] == "explorer":
+			if not _focused_once and e["kind"] == "explorer" and link.role != "player":
 				_focused_once = true
 				camera.focus_on(node.position)
 	for id: int in _visuals.keys():
@@ -121,10 +144,19 @@ func _on_snapshot(snap: Dictionary) -> void:
 			_latest.erase(id)
 			if id == selected_id:
 				_select(-1)
+			if id == follow_id:
+				follow_id = -1
+
+	if _focus_own and link.my_entity_id != -1 and _visuals.has(link.my_entity_id):
+		_focus_own = false
+		_focused_once = true
+		_select(link.my_entity_id)
+		camera.distance = minf(camera.distance, planet.radius * 1.6)
+		camera.focus_on(_visuals[link.my_entity_id].position)
 
 	for ev: Dictionary in snap["events"]:
 		_log_event(ev)
-	hud.show_status(snap)
+	hud.show_status(snap, link)
 	_refresh_selected_info()
 
 
@@ -138,6 +170,8 @@ func _process(delta: float) -> void:
 		var speech := node.get_node_or_null("Speech") as Label3D
 		if speech != null:
 			speech.visible = (camera.global_position - node.position).dot(node.position) > 0.0
+	if follow_id != -1 and _visuals.has(follow_id):
+		camera.focus_on(_visuals[follow_id].position)
 	if selected_id != -1 and _visuals.has(selected_id):
 		var n: Node3D = _visuals[selected_id]
 		_ring.transform = n.transform
@@ -168,8 +202,13 @@ func _log_event(ev: Dictionary) -> void:
 			if ev["entity_id"] == selected_id:
 				hud.log_line("#%d stopped: %s" % [ev["entity_id"], ev["reason"]])
 		"entity_said":
-			hud.log_line("#%d says: \"%s\"" % [ev["entity_id"], ev["text"]])
+			var who := speaker_name(ev["entity_id"])
+			var far := ""
+			if float(ev.get("distance", 0.0)) >= 1.0:
+				far = "  (%d m)" % int(ev["distance"])
+			hud.chat_line("%s: %s%s" % [who, ev["text"], far])
 			_show_speech(ev["entity_id"], ev["text"])
+			spectator.on_speech(ev["entity_id"])
 
 
 # --- input -> commands --------------------------------------------------------
@@ -177,14 +216,18 @@ func _log_event(ev: Dictionary) -> void:
 func _unhandled_input(event: InputEvent) -> void:
 	if planet == null:
 		return
+	if event is InputEventMouseMotion and follow_id != -1 \
+			and (event as InputEventMouseMotion).button_mask & MOUSE_BUTTON_MASK_LEFT:
+		stop_following()   # grabbing the camera takes it back
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_LEFT and not mb.pressed and camera.drag_distance < 6.0:
 			_select(_pick_entity(mb.position))
-		elif mb.button_index == MOUSE_BUTTON_RIGHT and mb.pressed and selected_id != -1:
-			var target: Variant = _pick_ground(mb.position)
+		elif mb.button_index == MOUSE_BUTTON_RIGHT and mb.pressed:
+			var who: int = _my_walker()
+			var target: Variant = _pick_ground(mb.position) if who != -1 else null
 			if target != null:
-				server.submit_command(Commands.move_to(ISSUER, selected_id, target))
+				link.submit_command(Commands.move_to(link.issuer, who, target))
 	elif event is InputEventKey and event.pressed and not event.echo:
 		var key := (event as InputEventKey).keycode
 		match key:
@@ -197,40 +240,118 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_A:
 				_spawn_agent_at_mouse()
 			KEY_DELETE, KEY_BACKSPACE, KEY_X:
-				if selected_id != -1:
-					server.submit_command(Commands.despawn(ISSUER, selected_id))
+				if selected_id != -1 and link.can_edit_world():
+					link.submit_command(Commands.despawn(link.issuer, selected_id))
 			KEY_F:
-				if _visuals.has(selected_id):
-					camera.focus_on(_visuals[selected_id].position)
+				var id: int = selected_id if selected_id != -1 else link.my_entity_id
+				if _visuals.has(id):
+					camera.focus_on(_visuals[id].position)
+			KEY_TAB:
+				spectator.next_ai()
+			KEY_G:
+				spectator.toggle_auto()
+			KEY_P:
+				hud.toggle_players()
+			KEY_R:
+				if link.role == "player" and link.my_entity_id == -1:
+					link.respawn()
+			KEY_ENTER, KEY_KP_ENTER:
+				if link.can_chat():
+					hud.open_chat()
+					get_viewport().set_input_as_handled()
 			KEY_SPACE:
-				server.set_paused(not server.paused)
+				link.set_paused(not link.paused)
 			KEY_EQUAL, KEY_PLUS, KEY_KP_ADD:
-				server.set_speed(server.speed * 2.0)
+				link.set_speed(link.speed * 2.0)
 			KEY_MINUS, KEY_KP_SUBTRACT:
-				server.set_speed(server.speed / 2.0)
+				link.set_speed(link.speed / 2.0)
 			KEY_PERIOD:
-				if server.paused:
-					server.step_once()
+				if link.paused:
+					link.step_once()
 			KEY_ESCAPE:
+				stop_following()
 				_select(-1)
 
 
+## The entity a right-click should send walking: a player's own explorer, or
+## (single player / host) whatever is selected.
+func _my_walker() -> int:
+	match link.role:
+		"player":
+			return link.my_entity_id
+		"admin":
+			return selected_id
+	return -1
+
+
+## Chat is spoken by your explorer (or, for the host, the selected entity), so
+## only those near it hear it.
+func _send_chat(text: String) -> void:
+	var who: int = _my_walker()
+	if who == -1:
+		hud.log_line("! select something to speak through it" if link.role == "admin"
+			else "! you need an explorer to talk (press R)")
+		return
+	link.submit_command(Commands.say(link.issuer, who, text))
+
+
 func _spawn_at_mouse(kind: String) -> void:
+	if not link.can_edit_world():
+		return
 	var target: Variant = _pick_ground(get_viewport().get_mouse_position())
 	if target == null:
 		hud.log_line("! point the mouse at the planet to spawn")
 		return
-	server.submit_command(Commands.spawn(ISSUER, kind, target))
+	link.submit_command(Commands.spawn(link.issuer, kind, target))
 
 
 ## Spawn an explorer run by the example "curious" AI agent.
 func _spawn_agent_at_mouse() -> void:
+	if not link.can_edit_world():
+		return
 	var target: Variant = _pick_ground(get_viewport().get_mouse_position())
 	if target == null:
 		hud.log_line("! point the mouse at the planet to spawn")
 		return
-	_agent_count += 1
-	server.agents.spawn_agent(CuriousAgent.new(_agent_count), "explorer", target)
+	link.request_agent("explorer", target)
+
+
+# --- following (spectators, and anyone who presses Tab) -------------------------
+
+func follow(id: int) -> void:
+	if not _visuals.has(id):
+		return
+	follow_id = id
+	_select(id)
+	if planet != null and camera.distance > planet.radius * 1.8:
+		camera.distance = planet.radius * 1.6   # close enough to read the speech
+
+
+func stop_following() -> void:
+	follow_id = -1
+	if spectator.auto:
+		spectator.toggle_auto()
+
+
+## Ids of entities driven by AI agents, in a stable order.
+func ai_entity_ids() -> Array:
+	var ids: Array = []
+	for id: int in _latest:
+		if str(_latest[id]["controller"]).begins_with("agent:"):
+			ids.append(id)
+	ids.sort()
+	return ids
+
+
+## "alice", "curious (AI)", or "critter #12".
+func speaker_name(id: int) -> String:
+	if not _latest.has(id):
+		return "#%d" % id
+	var e: Dictionary = _latest[id]
+	var label := Protocol.controller_label(str(e["controller"]))
+	if label != "":
+		return "%s #%d" % [label, id]
+	return "%s #%d" % [e["kind"], id]
 
 
 ## A speech bubble over an entity's head for a few seconds.
@@ -274,7 +395,7 @@ func _refresh_selected_info() -> void:
 	var t: Dictionary = _snapshot["time"]
 	var sun_dir: Vector3 = t["sun_direction"]
 	var hour := fposmod(float(t["hour_at_lon0"]) / 24.0 + float(e["lon"]) / 360.0, 1.0) * 24.0
-	hud.show_selected(e, hour, (e["dir"] as Vector3).dot(sun_dir) > 0.0)
+	hud.show_selected(e, hour, (e["dir"] as Vector3).dot(sun_dir) > 0.0, selected_id == follow_id)
 
 
 ## The visible entity closest to the cursor, or -1.

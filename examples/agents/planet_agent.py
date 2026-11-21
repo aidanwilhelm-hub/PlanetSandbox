@@ -19,16 +19,27 @@ world keeps running and the NPC keeps doing what it was last told.
 """
 
 import json
+import os
 import socket
 
 
-def run(decide, name="python", kind="explorer", host="127.0.0.1", port=7777,
+def run(decide, name="python", kind="explorer", host=None, port=7777,
         think_every=20, sight_range=30.0, lat=None, lon=None, entity_id=None,
-        verbose=True):
+        password=None, verbose=True):
     """Connect, join, then answer every observation with decide(obs) until the
-    NPC is removed or the game closes."""
+    NPC is removed or the game closes.
+
+    If the server has a password, pass it as `password` or set the
+    PLANET_PASSWORD environment variable. `host` may be another computer's
+    address when the server has a password."""
+    if password is None:
+        password = os.environ.get("PLANET_PASSWORD")
+    if host is None:
+        host = os.environ.get("PLANET_HOST", "127.0.0.1")
     join = {"op": "join", "name": name, "kind": kind,
             "think_every": think_every, "sight_range": sight_range}
+    if password:
+        join["password"] = password
     if lat is not None and lon is not None:
         join.update(lat=lat, lon=lon)
     if entity_id is not None:
