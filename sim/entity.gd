@@ -17,7 +17,12 @@ var brain := ""                   ## built-in behavior that drives it, if any
 var state := "idle"               ## idle | moving
 var has_target := false
 var target_dir := Vector3.ZERO
+var medium := "dry"               ## dry | wading | floating (see sim/water.gd)
 var data: Dictionary = {}         ## free-form extra state for future systems
+
+## Bookkeeping for "stuck" detection; not part of the world's public state.
+var stuck_ticks := 0
+var best_distance := INF
 
 
 func to_dict() -> Dictionary:
@@ -31,6 +36,7 @@ func to_dict() -> Dictionary:
 		"lon": ll.y,
 		"heading": heading,
 		"state": state,
+		"medium": medium,
 		"controller": controller,
 		"brain": brain,
 		"target": target_dir if has_target else null,

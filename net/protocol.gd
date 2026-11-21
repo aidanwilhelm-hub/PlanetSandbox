@@ -20,6 +20,7 @@
 ##   you      {entity_id, mod}           your explorer or moderator status changed
 ##   players  {list}                     who is connected, with ping
 ##   notice   {text}                     a line for your log (e.g. "not allowed")
+##   planet   {planet}                   the host loaded a saved world
 ##   kicked   {reason}
 extends RefCounted
 

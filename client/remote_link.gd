@@ -63,6 +63,8 @@ func _on_message(msg: Dictionary) -> void:
 			my_entity_id = int(msg.get("entity_id", -1))
 			is_mod = bool(msg.get("mod", false))
 			identity_changed.emit()
+		"planet":
+			_planet = msg.get("planet", _planet)
 		"players":
 			players = msg.get("list", [])
 			players_changed.emit(players)

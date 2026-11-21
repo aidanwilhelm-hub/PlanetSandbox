@@ -67,6 +67,7 @@ func listen(p_port: int = Protocol.DEFAULT_PORT, bind_address: String = "*") -> 
 	_enet.peer_connected.connect(_on_connected)
 	_enet.peer_disconnected.connect(_on_disconnected)
 	server.snapshot_published.connect(_on_snapshot)
+	server.world_loaded.connect(_on_world_loaded)
 	return OK
 
 
@@ -82,6 +83,8 @@ func stop() -> void:
 	_enet = null
 	if server.snapshot_published.is_connected(_on_snapshot):
 		server.snapshot_published.disconnect(_on_snapshot)
+	if server.world_loaded.is_connected(_on_world_loaded):
+		server.world_loaded.disconnect(_on_world_loaded)
 
 
 func _exit_tree() -> void:
@@ -211,6 +214,23 @@ func _hello(p: Dictionary, msg: Dictionary) -> void:
 	if p["role"] == "player":
 		_spawn_body(p)
 	log_message.emit("%s joined as %s%s" % [p["name"], p["role"], " (moderator)" if p["mod"] else ""])
+	_players_updated()
+
+
+## The host loaded a saved world: everyone gets the (maybe different) planet
+## and players get fresh explorers.
+func _on_world_loaded() -> void:
+	_orphans.clear()
+	for p: Dictionary in peers.values():
+		if p["role"] == "pending":
+			continue
+		_send(p["id"], {"op": "planet", "planet": server.sim.planet.to_dict()})
+		_notice(p, "The host loaded a saved world.")
+		if p["role"] == "player":
+			p["entity_id"] = -1
+			p["spawning"] = false
+			_send_you(p)
+			_spawn_body(p)
 	_players_updated()
 
 

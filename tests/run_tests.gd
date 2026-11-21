@@ -14,6 +14,9 @@ const PatrolAgent = preload("res://agents/examples/patrol_agent.gd")
 const CuriousAgent = preload("res://agents/examples/curious_agent.gd")
 const AgentBridge = preload("res://agents/bridge/agent_bridge.gd")
 const Protocol = preload("res://net/protocol.gd")
+const Water = preload("res://sim/water.gd")
+const EntityKinds = preload("res://sim/entity_kinds.gd")
+const Physics = preload("res://sim/physics.gd")
 const AuthGuard = preload("res://net/auth_guard.gd")
 const NetServer = preload("res://net/net_server.gd")
 const NetClient = preload("res://net/net_client.gd")
@@ -87,6 +90,12 @@ func _initialize() -> void:
 		"test_multiplayer_wrong_password_and_block",
 		"test_population_keeper",
 		"test_local_link_roles",
+		"test_walkers_bump_into_trees",
+		"test_crowds_spread_out",
+		"test_wading_in_shallow_water",
+		"test_rafts_float_and_drift",
+		"test_save_and_load",
+		"test_server_save_file",
 	]
 	for t: String in tests:
 		var before := _failures
@@ -292,7 +301,7 @@ func test_walkers_stop_at_water() -> void:
 	var e := sim.get_entity(id)
 	check(_events_of(events, "entity_blocked").size() >= 1 or _events_of(events, "entity_arrived").size() == 1,
 		"either reached the far side or stopped at water")
-	check(sim.planet.is_land(e.dir), "never walked into the sea")
+	check(sim.planet.height_at(e.dir) > -Water.WADE_DEPTH, "never walked into deep water")
 
 
 func test_wander_brain_moves_critters_by_day_only() -> void:
@@ -1040,4 +1049,131 @@ func test_local_link_roles() -> void:
 	check(not watch.can_edit_world() and watch.can_control_time(), "a local watcher can't edit but can pause their own world")
 	host.free()
 	watch.free()
+	server.free()
+
+
+# --- physics, water, saving ------------------------------------------------------
+
+func _spawn_one(sim: Simulation, kind: String, where: Vector3) -> int:
+	sim.submit_command(Commands.spawn(Commands.ADMIN, kind, where))
+	sim.step()
+	for ev in sim.events:
+		if ev["type"] == "entity_spawned":
+			return ev["entity_id"]
+	return -1
+
+
+func test_walkers_bump_into_trees() -> void:
+	var sim := Simulation.new()
+	var walk := _land_walk(sim, 8.0)
+	if walk.is_empty():
+		check(false, "found a land walk")
+		return
+	var mid: Vector3 = walk[0].slerp(walk[1], 0.5).normalized()
+	var tree := _spawn_one(sim, "tree", mid)
+	var walker := _spawn_one(sim, "explorer", walk[0])
+	sim.submit_command(Commands.move_to(Commands.ADMIN, walker, mid))   # straight into the tree
+	var closest := INF
+	var events: Array = []
+	for i in 600:
+		sim.step()
+		events.append_array(sim.events)
+		closest = minf(closest, sim.get_entity(walker).position.distance_to(sim.get_entity(tree).position))
+	check(closest > 1.4, "the walker never walks through the tree (closest %.2f m)" % closest)
+	check(sim.get_entity(tree).dir == mid, "the tree didn't budge")
+	check(_events_of(events, "entity_arrived").size() + _events_of(events, "entity_blocked").size() == 1,
+		"walking into a tree ends (arrived next to it) instead of pushing forever")
+
+
+func test_crowds_spread_out() -> void:
+	var sim := Simulation.new()
+	var spot := _land_dir(sim)
+	var a := _spawn_one(sim, "explorer", spot)
+	var b := _spawn_one(sim, "explorer", spot)
+	_run(sim, 40)
+	var d := sim.get_entity(a).position.distance_to(sim.get_entity(b).position)
+	check(d > 1.5, "two explorers on the same spot push each other apart (%.2f m)" % d)
+
+
+## A direction with water between `lo` and `hi` meters deep.
+func _water_dir(sim: Simulation, lo: float, hi: float) -> Vector3:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 11
+	for i in 20000:
+		var d := Geo.random_dir(rng)
+		var depth := Water.depth(sim.planet, d)
+		if depth > lo and depth < hi:
+			return d
+	return Vector3.ZERO
+
+
+func test_wading_in_shallow_water() -> void:
+	var sim := Simulation.new()
+	var shallow := _water_dir(sim, 0.2, 0.8)
+	var deep := _water_dir(sim, 2.0, 99.0)
+	var walker_def: Dictionary = EntityKinds.KINDS["explorer"]
+	check(shallow != Vector3.ZERO and deep != Vector3.ZERO, "found shallow and deep water")
+	check(Water.can_be_at(sim.planet, walker_def, shallow), "walkers may wade in shallow water")
+	check(not Water.can_be_at(sim.planet, walker_def, deep), "but not deep water")
+	check(Water.speed_factor(sim.planet, walker_def, shallow) == Water.WADE_SPEED, "wading is slower")
+	check(Water.medium(sim.planet, walker_def, shallow) == "wading", "and shows as wading")
+	check(Water.current_at(sim.planet, shallow + Vector3.ZERO).length() <= Water.MAX_CURRENT * 0.5,
+		"currents are weak near the shore")
+
+
+func test_rafts_float_and_drift() -> void:
+	var sim := Simulation.new()
+	var deep := _water_dir(sim, 3.0, 99.0)
+	var raft := _spawn_one(sim, "raft", deep)
+	check(raft != -1, "a raft can be put on open water")
+	check(_spawn_one(sim, "raft", _land_dir(sim)) == -1, "but not on land")
+	var start := sim.get_entity(raft).dir
+	_run(sim, 400)
+	var e := sim.get_entity(raft)
+	check(e.dir.angle_to(start) * sim.planet.radius > 1.0, "an idle raft drifts with the current")
+	check(Water.depth(sim.planet, e.dir) >= Water.FLOAT_DEPTH, "and stays afloat")
+	check(e.to_dict()["medium"] == "floating", "it shows as floating")
+
+
+func _world_hash_after(sim: Simulation, ticks: int) -> int:
+	_run(sim, ticks)
+	return sim.state_hash()
+
+
+func test_save_and_load() -> void:
+	var sim := Simulation.new({"seed": 5})
+	sim.populate()
+	_run(sim, 100)
+	var save := sim.save_state()
+	var expected := _world_hash_after(sim, 200)
+	var copy := Simulation.new()   # a different (default) seed until loaded
+	check(copy.load_state(bytes_to_var(var_to_bytes(save))) == "", "save loads")
+	check(copy.planet.world_seed == 5, "the planet comes back too")
+	check(_world_hash_after(copy, 200) == expected, "a loaded world carries on exactly as the original")
+	check(Simulation.new().load_state({"version": 999}) != "", "a save from another version is refused")
+
+
+func test_server_save_file() -> void:
+	var server := SimServer.new()
+	server.start({"seed": 9})
+	var agent := ScriptedAgent.new()
+	server.agents.spawn_agent(agent, "explorer", _land_dir(server.sim))
+	server._process(0.2)
+	var count := server.sim.entities.size()
+	var path := "user://test_saves/slot_test.save"
+	check(server.save_game(path) == OK, "server saves to a file")
+	server.submit_command(Commands.despawn(Commands.ADMIN, server.sim.entities.keys()[0]))
+	server._process(0.2)
+	var loaded := [false]
+	server.world_loaded.connect(func() -> void: loaded[0] = true)
+	check(server.load_game(path) == "", "and loads it back")
+	check(loaded[0] and server.sim.entities.size() == count, "the world is as it was saved")
+	check(server.agents.agents.is_empty() and agent.detached_reason != "", "AI agents are let go on load")
+	var body_ctrl := ""
+	for e in server.sim.entities.values():
+		if e.kind == "explorer" and e.controller.begins_with("agent:"):
+			body_ctrl = e.controller
+	check(body_ctrl == "", "saved bodies don't keep agent controllers")
+	check(server.load_game("user://test_saves/missing.save") != "", "a missing save is reported, not a crash")
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
 	server.free()
