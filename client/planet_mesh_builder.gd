@@ -54,18 +54,52 @@ static func build(planet: RefCounted, resolution: int = 96) -> ArrayMesh:
 	return mesh
 
 
+## Moving waves: the sea surface rises and falls a little, and its shading
+## ripples. Cosmetic only; the simulation's sea level stays at 0.
+const OCEAN_SHADER := """
+shader_type spatial;
+render_mode blend_mix, cull_back, specular_schlick_ggx;
+
+uniform vec4 deep_color : source_color = vec4(0.06, 0.24, 0.52, 1.0);
+uniform vec4 shallow_color : source_color = vec4(0.16, 0.48, 0.66, 1.0);
+uniform float wave_height = 0.18;
+
+float waves(vec3 p, float t) {
+	return sin(p.x * 0.35 + t * 1.1) * 0.5
+		+ sin(p.z * 0.29 - t * 0.9) * 0.35
+		+ sin((p.x + p.y) * 0.61 + t * 1.7) * 0.15;
+}
+
+varying float v_wave;
+
+void vertex() {
+	float w = waves(VERTEX, TIME);
+	v_wave = w;
+	VERTEX += NORMAL * w * wave_height;
+}
+
+void fragment() {
+	float rim = pow(1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0), 3.0);
+	ALBEDO = mix(deep_color.rgb, shallow_color.rgb, 0.5 + 0.5 * v_wave);
+	ROUGHNESS = 0.08 + 0.06 * v_wave;
+	SPECULAR = 0.7;
+	ALPHA = mix(0.70, 0.92, rim);
+}
+"""
+
+
 static func build_ocean(planet: RefCounted) -> MeshInstance3D:
 	var sphere := SphereMesh.new()
 	sphere.radius = planet.radius
 	sphere.height = planet.radius * 2.0
-	sphere.radial_segments = 128
-	sphere.rings = 64
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.10, 0.32, 0.62, 0.72)
-	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.roughness = 0.12
-	mat.metallic_specular = 0.8
+	sphere.radial_segments = 192
+	sphere.rings = 96
+	var shader := Shader.new()
+	shader.code = OCEAN_SHADER
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
 	var inst := MeshInstance3D.new()
+	inst.name = "Ocean"
 	inst.mesh = sphere
 	inst.material_override = mat
 	inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF

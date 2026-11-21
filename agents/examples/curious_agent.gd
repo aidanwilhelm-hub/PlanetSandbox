@@ -9,9 +9,13 @@
 extends "res://agents/agent.gd"
 
 const GREET_DISTANCE := 4.0
+## Answer the same speaker at most once in this many ticks (30 s), so two
+## curious agents don't greet each other back and forth forever.
+const ANSWER_COOLDOWN_TICKS := 600
 
 var _greeted := {}            ## entity id -> true (or "gave up")
 var _chasing := -1
+var _answered := {}           ## speaker id -> tick we last answered them
 var _rng := RandomNumberGenerator.new()
 
 
@@ -29,7 +33,10 @@ func decide(obs: Dictionary) -> Variant:
 			_greeted[_chasing] = true     # can't reach it (water in the way); forget it
 			_chasing = -1
 		elif ev["type"] == "heard":
-			actions.append({"action": "say", "text": "Hi #%d! I'm out exploring." % ev["from"]})
+			var from: int = ev["from"]
+			if int(ev["tick"]) - int(_answered.get(from, -ANSWER_COOLDOWN_TICKS)) >= ANSWER_COOLDOWN_TICKS:
+				_answered[from] = int(ev["tick"])
+				actions.append({"action": "say", "text": "Hi #%d! I'm out exploring." % from})
 
 	if not obs["time"]["is_day"]:
 		if me["state"] == "moving":

@@ -13,6 +13,15 @@ const AgentRuntime = preload("res://agents/agent_runtime.gd")
 const PatrolAgent = preload("res://agents/examples/patrol_agent.gd")
 const CuriousAgent = preload("res://agents/examples/curious_agent.gd")
 const AgentBridge = preload("res://agents/bridge/agent_bridge.gd")
+const Protocol = preload("res://net/protocol.gd")
+const Water = preload("res://sim/water.gd")
+const EntityKinds = preload("res://sim/entity_kinds.gd")
+const Physics = preload("res://sim/physics.gd")
+const AuthGuard = preload("res://net/auth_guard.gd")
+const NetServer = preload("res://net/net_server.gd")
+const NetClient = preload("res://net/net_client.gd")
+const PopulationKeeper = preload("res://server/population_keeper.gd")
+const LocalLink = preload("res://client/local_link.gd")
 
 
 ## Test agent: records every observation and replays scripted answers.
@@ -72,6 +81,21 @@ func _initialize() -> void:
 		"test_agents_are_deterministic",
 		"test_server_runs_agents",
 		"test_bridge_drives_an_npc_over_tcp",
+		"test_protocol_round_trip",
+		"test_auth_guard_soft_blocks",
+		"test_bridge_password",
+		"test_multiplayer_join_and_permissions",
+		"test_multiplayer_proximity_chat",
+		"test_multiplayer_creative_and_moderators",
+		"test_multiplayer_wrong_password_and_block",
+		"test_population_keeper",
+		"test_local_link_roles",
+		"test_walkers_bump_into_trees",
+		"test_crowds_spread_out",
+		"test_wading_in_shallow_water",
+		"test_rafts_float_and_drift",
+		"test_save_and_load",
+		"test_server_save_file",
 	]
 	for t: String in tests:
 		var before := _failures
@@ -277,7 +301,7 @@ func test_walkers_stop_at_water() -> void:
 	var e := sim.get_entity(id)
 	check(_events_of(events, "entity_blocked").size() >= 1 or _events_of(events, "entity_arrived").size() == 1,
 		"either reached the far side or stopped at water")
-	check(sim.planet.is_land(e.dir), "never walked into the sea")
+	check(sim.planet.height_at(e.dir) > -Water.WADE_DEPTH, "never walked into deep water")
 
 
 func test_wander_brain_moves_critters_by_day_only() -> void:
@@ -717,3 +741,439 @@ func test_bridge_drives_an_npc_over_tcp() -> void:
 	check(runtime.agents.is_empty(), "disconnecting removes the agent")
 	check(sim.entities.is_empty(), "and its body")
 	bridge.free()
+
+
+# --- multiplayer ---------------------------------------------------------------
+
+func test_protocol_round_trip() -> void:
+	var sim := Simulation.new()
+	sim.populate()
+	var snap := sim.snapshot()
+	var msg := {"op": "state", "tick": snap["tick"], "time": snap["time"], "entities": snap["entities"]}
+	var bytes := Protocol.encode(msg)
+	var back: Variant = Protocol.decode(bytes)
+	check(back is Dictionary and var_to_str(back) == var_to_str(msg), "state survives encode/decode exactly")
+	check(bytes.size() < 20000, "a full world state is small enough to send 10x a second (%d bytes)" % bytes.size())
+	check(Protocol.decode(PackedByteArray([1, 2, 3, 4, 5, 6])) == null, "garbage decodes to null")
+	check(Protocol.decode(Protocol.encode({"no_op": 1})) == null, "a message needs an op")
+	check(Protocol.clean_name(" al:ice ") == "al_ice", "names can't break controller ids")
+	check(Protocol.controller_label("player:alice:5") == "alice", "player label")
+
+
+func test_auth_guard_soft_blocks() -> void:
+	var g := AuthGuard.new("secret")
+	g.now_override = 100.0
+	check(g.check("1.2.3.4", "secret") == "ok", "right password")
+	for i in AuthGuard.MAX_FAILURES - 1:
+		g.check("1.2.3.4", "nope")
+	check(not g.is_blocked("1.2.3.4"), "not blocked after 9 wrong guesses")
+	check(g.check("1.2.3.4", "nope") == "wrong", "10th wrong guess")
+	check(g.check("1.2.3.4", "secret") == "blocked", "after 10 wrong guesses even the right password is refused")
+	check(g.check("5.6.7.8", "secret") == "ok", "other addresses are unaffected")
+	check(g.minutes_left("1.2.3.4") == 10, "blocked for 10 minutes")
+	g.now_override = 100.0 + AuthGuard.BLOCK_SECONDS + 1.0
+	check(g.check("1.2.3.4", "secret") == "ok", "block ends, then the right password works")
+	check(AuthGuard.new("").check("x", "") == "ok", "no password set = anyone may join")
+
+
+func test_bridge_password() -> void:
+	var sim := Simulation.new()
+	var runtime := AgentRuntime.new(sim)
+	var bridge := AgentBridge.new(runtime)
+	bridge.guard = AuthGuard.new("pw")
+	var port := 48000 + randi() % 1000
+	check(bridge.listen(port) == OK, "bridge with password listens")
+	var bad := StreamPeerTCP.new()
+	bad.connect_to_host("127.0.0.1", port)
+	_pump(sim, runtime, bridge, bad, 20)
+	_send_line(bad, {"op": "join", "name": "x", "password": "wrong"})
+	_pump(sim, runtime, bridge, bad, 20)
+	var msgs := _read_client_lines(bad)
+	check(msgs.size() > 0 and msgs[0].get("message", "") == "wrong password", "wrong password refused (%s)" % str(msgs))
+	check(runtime.agents.is_empty() and sim.entities.is_empty(), "no body for a wrong password")
+	var good := StreamPeerTCP.new()
+	good.connect_to_host("127.0.0.1", port)
+	_pump(sim, runtime, bridge, good, 20)
+	_send_line(good, {"op": "join", "name": "y", "password": "pw"})
+	_pump(sim, runtime, bridge, good, 30)
+	var ops := _read_client_lines(good).map(func(m: Dictionary) -> String: return m.get("op", ""))
+	check(ops.has("joined"), "right password joins (%s)" % str(ops))
+	bridge.free()
+
+
+## A little networked world in one process: a SimServer, a NetServer and clients.
+class NetWorld:
+	var server: Node
+	var net: Node
+	var clients: Array = []
+	var port := 0
+
+	func _init(password: String, mode: String) -> void:
+		server = SimServer.new()
+		server.start({}, false)
+		net = NetServer.new(server, AuthGuard.new(password))
+		net.mode = mode
+		port = 49000 + randi() % 1000
+		net.listen(port, "127.0.0.1")
+
+	func join(player_name: String, password: String, role: String = "player") -> Dictionary:
+		var c := NetClient.new()
+		var log := {"client": c, "welcome": null, "states": [], "events": [], "msgs": [], "closed": ""}
+		c.welcomed.connect(func(info: Dictionary) -> void: log["welcome"] = info)
+		c.state_received.connect(func(st: Dictionary, evs: Array) -> void:
+			log["states"].append(st)
+			log["events"].append_array(evs))
+		c.message_received.connect(func(m: Dictionary) -> void: log["msgs"].append(m))
+		c.disconnected.connect(func(reason: String) -> void: log["closed"] = reason)
+		c.connect_to("127.0.0.1", port, {"name": player_name, "role": role, "password": password})
+		clients.append(log)
+		return log
+
+	## Run everything for a number of frames (real time passes so ENet can work).
+	func pump(frames: int, dt: float = 0.02) -> void:
+		for i in frames:
+			server._process(dt)
+			net._process(dt)
+			for log: Dictionary in clients:
+				(log["client"] as Node)._process(dt)
+			OS.delay_msec(3)
+
+	## Pump until cond() is true (or give up).
+	func pump_until(cond: Callable, max_frames: int = 300) -> bool:
+		for i in max_frames:
+			if cond.call():
+				return true
+			pump(1)
+		return cond.call()
+
+	func body(log: Dictionary) -> int:
+		var last := -1
+		for m: Dictionary in log["msgs"]:
+			if m["op"] == "you":
+				last = int(m["entity_id"])
+		return last
+
+	func send(log: Dictionary, msg: Dictionary) -> void:
+		(log["client"] as Node).send(msg)
+
+	func close() -> void:
+		for log: Dictionary in clients:
+			(log["client"] as Node).free()
+		net.stop()
+		net.free()
+		server.free()
+
+
+func _said_texts(events: Array) -> Array:
+	return _events_of(events, "entity_said").map(func(e: Dictionary) -> String: return e["text"])
+
+
+func test_multiplayer_join_and_permissions() -> void:
+	var w := NetWorld.new("pw", Protocol.MODE_SURVIVAL)
+	var alice := w.join("alice", "pw")
+	var bob := w.join("bob", "pw")
+	var watcher := w.join("eve", "pw", "spectator")
+	check(w.pump_until(func() -> bool: return w.body(alice) != -1 and w.body(bob) != -1 and watcher["welcome"] != null),
+		"two players and a spectator join")
+	check(alice["welcome"]["issuer"].begins_with("player:alice:"), "server names the player")
+	check(alice["welcome"]["planet"]["seed"] == w.server.sim.planet.world_seed, "welcome carries the planet seed")
+	check(watcher["welcome"]["role"] == "spectator", "spectator role")
+	w.pump(10)
+	check(alice["states"].size() > 0, "players receive world states")
+	var last_state: Dictionary = alice["states"].back()
+	check(last_state["entities"].size() == w.server.sim.entities.size(), "states hold every entity")
+	check(not last_state.has("planet"), "terrain is never re-sent")
+	var a_id := w.body(alice)
+	var b_id := w.body(bob)
+	var a_ent = w.server.sim.get_entity(a_id)
+	check(a_ent != null and str(a_ent.controller).begins_with("player:alice"), "alice controls her own explorer")
+
+	# Pretending to be the host doesn't work.
+	var before: int = w.server.sim.entities.size()
+	w.send(alice, {"op": "cmd", "command": {"type": "spawn", "issuer": "admin", "kind": "tree", "target": a_ent.dir}})
+	w.send(alice, {"op": "cmd", "command": {"type": "despawn", "issuer": "admin", "entity_id": b_id}})
+	w.pump(15)
+	check(w.server.sim.entities.size() == before, "survival players can't spawn or remove, even claiming to be admin")
+	check(alice["msgs"].any(func(m: Dictionary) -> bool: return m["op"] == "notice"), "and are told why")
+
+	# Own explorer yes, someone else's no.
+	var b_ent = w.server.sim.get_entity(b_id)
+	w.send(alice, {"op": "cmd", "command": {"type": "move_to", "issuer": "admin", "entity_id": a_id, "target": b_ent.dir}})
+	w.send(alice, {"op": "cmd", "command": {"type": "move_to", "issuer": "admin", "entity_id": b_id, "target": a_ent.dir}})
+	w.pump(15)
+	check(a_ent.has_target or a_ent.dir != a_ent.target_dir, "alice can walk her explorer")
+	check(not b_ent.has_target, "alice can't move bob's explorer")
+	check(_events_of(alice["events"], "command_rejected").size() >= 1, "alice hears about her refused command")
+	check(_events_of(bob["events"], "command_rejected").is_empty(), "bob doesn't see alice's refusals")
+
+	# Spectators can't do anything.
+	w.send(watcher, {"op": "cmd", "command": {"type": "stop", "entity_id": a_id}})
+	w.send(watcher, {"op": "time", "paused": true})
+	w.pump(10)
+	check(not w.server.paused, "spectator can't pause")
+	w.send(alice, {"op": "time", "paused": true})
+	w.pump(10)
+	check(not w.server.paused, "a player who isn't a moderator can't pause")
+
+	# Leaving removes your explorer.
+	(bob["client"] as Node).close()
+	check(w.pump_until(func() -> bool: return w.server.sim.get_entity(b_id) == null), "bob's explorer disappears when he leaves")
+	check(w.pump_until(func() -> bool: return w.net.player_list().size() == 2), "player list updates")
+	w.close()
+
+
+## Spawn an explorer exactly `meters` from `from_dir` (on land), or return -1.
+func _explorer_at_distance(sim: Simulation, from_dir: Vector3, meters: float) -> int:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 3
+	for i in 200:
+		var axis := from_dir.cross(Vector3(rng.randf() - 0.5, rng.randf() - 0.5, rng.randf() - 0.5)).normalized()
+		if axis.length_squared() < 0.5:
+			continue
+		var d := from_dir.rotated(axis, meters / sim.planet.radius)
+		if sim.planet.is_land(d):
+			sim.submit_command(Commands.spawn(Commands.ADMIN, "explorer", d))
+			sim.step()
+			for ev in sim.events:
+				if ev["type"] == "entity_spawned":
+					return ev["entity_id"]
+	return -1
+
+
+func test_multiplayer_proximity_chat() -> void:
+	var w := NetWorld.new("", Protocol.MODE_SURVIVAL)
+	var alice := w.join("alice", "")
+	var watcher := w.join("eve", "", "spectator")
+	check(w.pump_until(func() -> bool: return w.body(alice) != -1 and watcher["welcome"] != null), "joined")
+	var a_dir: Vector3 = w.server.sim.get_entity(w.body(alice)).dir
+	var near := _explorer_at_distance(w.server.sim, a_dir, 20.0)
+	var far := _explorer_at_distance(w.server.sim, a_dir, 50.0)
+	check(near != -1 and far != -1, "test speakers placed")
+	w.server.submit_command(Commands.say(Commands.ADMIN, near, "hello from close by"))
+	w.server.submit_command(Commands.say(Commands.ADMIN, far, "hello from far away"))
+	w.send(alice, {"op": "cmd", "command": {"type": "say", "entity_id": w.body(alice), "text": "hi all"}})
+	w.pump(25)
+	var heard := _said_texts(alice["events"])
+	check(heard.has("hello from close by"), "a player hears someone 20 m away (%s)" % str(heard))
+	check(not heard.has("hello from far away"), "but not someone 50 m away")
+	check(heard.has("hi all"), "and hears themselves")
+	var near_ev: Array = _events_of(alice["events"], "entity_said").filter(func(e: Dictionary) -> bool:
+		return e["text"] == "hello from close by")
+	check(near_ev.size() == 1 and absf(float(near_ev[0]["distance"]) - 20.0) < 0.5,
+		"each line carries the distance, for voice volume later")
+	var all := _said_texts(watcher["events"])
+	check(all.has("hello from far away") and all.has("hello from close by") and all.has("hi all"),
+		"spectators hear everything")
+	w.close()
+
+
+func test_multiplayer_creative_and_moderators() -> void:
+	var w := NetWorld.new("", Protocol.MODE_CREATIVE)
+	var alice := w.join("alice", "")
+	var bob := w.join("bob", "")
+	check(w.pump_until(func() -> bool: return w.body(alice) != -1 and w.body(bob) != -1), "joined")
+	var a_ent = w.server.sim.get_entity(w.body(alice))
+	var before: int = w.server.sim.entities.size()
+	w.send(alice, {"op": "cmd", "command": {"type": "spawn", "kind": "tree", "target": a_ent.dir}})
+	w.send(alice, {"op": "agent", "kind": "explorer", "target": a_ent.dir})
+	w.pump(15)
+	check(w.server.sim.entities.size() == before + 2, "creative players can spawn things and AI explorers")
+	check(w.server.agents.agents.size() == 1, "the AI explorer is running")
+	w.send(alice, {"op": "cmd", "command": {"type": "despawn", "entity_id": w.body(bob)}})
+	w.pump(10)
+	check(w.server.sim.get_entity(w.body(bob)) != null, "but can't remove another player's explorer")
+
+	# Moderators.
+	var alice_peer: int = alice["welcome"]["peer_id"]
+	var bob_peer: int = bob["welcome"]["peer_id"]
+	w.net.set_mod(alice_peer, true)
+	w.pump(5)
+	w.send(alice, {"op": "time", "paused": true, "speed": 4.0})
+	check(w.pump_until(func() -> bool: return w.server.paused), "a moderator can pause")
+	check(w.server.speed == 4.0, "and change speed")
+	w.send(alice, {"op": "time", "paused": false})
+	w.send(bob, {"op": "kick", "peer_id": alice_peer})
+	w.pump(10)
+	check(alice["closed"] == "", "a non-moderator can't kick")
+	w.send(alice, {"op": "kick", "peer_id": bob_peer})
+	check(w.pump_until(func() -> bool: return bob["closed"] != ""), "a moderator can kick (%s)" % bob["closed"])
+	check(bob["closed"].contains("alice"), "and the kicked player is told who did it")
+	w.close()
+
+
+func test_multiplayer_wrong_password_and_block() -> void:
+	var w := NetWorld.new("pw", Protocol.MODE_SURVIVAL)
+	var bad := w.join("mallory", "guess")
+	check(w.pump_until(func() -> bool: return bad["closed"] != ""), "wrong password is refused")
+	check(bad["closed"] == "Wrong password.", "with a clear reason (%s)" % bad["closed"])
+	check(w.server.sim.entities.is_empty(), "no explorer for a wrong password")
+	for i in AuthGuard.MAX_FAILURES - 1:
+		w.net.guard.check("127.0.0.1", "guess")
+	var right := w.join("mallory", "pw")
+	check(w.pump_until(func() -> bool: return right["closed"] != ""), "soft-blocked after 10 wrong passwords")
+	check(right["closed"].begins_with("Too many wrong passwords"), "told to try later (%s)" % right["closed"])
+	w.close()
+
+
+func test_population_keeper() -> void:
+	var server := SimServer.new()
+	server.start({}, false)
+	var keeper := PopulationKeeper.new(server, 3, 5)
+	server.add_child(keeper)
+	for i in 10:
+		server._process(0.1)
+	check(server.agents.agents.size() == 3, "sim mode starts the AI explorers (%d)" % server.agents.agents.size())
+	var critters := 0
+	for e in server.sim.entities.values():
+		if e.kind == "critter":
+			critters += 1
+	check(critters == 5, "and keeps critters stocked")
+	server.agents.detach(server.agents.agents[0], true, "test")
+	for i in 30:
+		server._process(0.1)
+	check(server.agents.agents.size() == 3, "a lost agent is replaced")
+	server.free()
+
+
+func test_local_link_roles() -> void:
+	var server := SimServer.new()
+	server.start({}, false)
+	var host := LocalLink.new(server)
+	var watch := LocalLink.new(server, null, true)
+	var d := _land_dir(server.sim)
+	watch.submit_command(Commands.spawn(Commands.ADMIN, "tree", d))
+	host.submit_command(Commands.spawn("someone", "critter", d))
+	server.step_once()
+	check(server.sim.entities.size() == 1, "only the single player's command lands")
+	check(server.sim.entities.values()[0].kind == "critter", "and it is sent as admin")
+	check(not watch.can_edit_world() and watch.can_control_time(), "a local watcher can't edit but can pause their own world")
+	host.free()
+	watch.free()
+	server.free()
+
+
+# --- physics, water, saving ------------------------------------------------------
+
+func _spawn_one(sim: Simulation, kind: String, where: Vector3) -> int:
+	sim.submit_command(Commands.spawn(Commands.ADMIN, kind, where))
+	sim.step()
+	for ev in sim.events:
+		if ev["type"] == "entity_spawned":
+			return ev["entity_id"]
+	return -1
+
+
+func test_walkers_bump_into_trees() -> void:
+	var sim := Simulation.new()
+	var walk := _land_walk(sim, 8.0)
+	if walk.is_empty():
+		check(false, "found a land walk")
+		return
+	var mid: Vector3 = walk[0].slerp(walk[1], 0.5).normalized()
+	var tree := _spawn_one(sim, "tree", mid)
+	var walker := _spawn_one(sim, "explorer", walk[0])
+	sim.submit_command(Commands.move_to(Commands.ADMIN, walker, mid))   # straight into the tree
+	var closest := INF
+	var events: Array = []
+	for i in 600:
+		sim.step()
+		events.append_array(sim.events)
+		closest = minf(closest, sim.get_entity(walker).position.distance_to(sim.get_entity(tree).position))
+	check(closest > 1.4, "the walker never walks through the tree (closest %.2f m)" % closest)
+	check(sim.get_entity(tree).dir == mid, "the tree didn't budge")
+	check(_events_of(events, "entity_arrived").size() + _events_of(events, "entity_blocked").size() == 1,
+		"walking into a tree ends (arrived next to it) instead of pushing forever")
+
+
+func test_crowds_spread_out() -> void:
+	var sim := Simulation.new()
+	var spot := _land_dir(sim)
+	var a := _spawn_one(sim, "explorer", spot)
+	var b := _spawn_one(sim, "explorer", spot)
+	_run(sim, 40)
+	var d := sim.get_entity(a).position.distance_to(sim.get_entity(b).position)
+	check(d > 1.5, "two explorers on the same spot push each other apart (%.2f m)" % d)
+
+
+## A direction with water between `lo` and `hi` meters deep.
+func _water_dir(sim: Simulation, lo: float, hi: float) -> Vector3:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 11
+	for i in 20000:
+		var d := Geo.random_dir(rng)
+		var depth := Water.depth(sim.planet, d)
+		if depth > lo and depth < hi:
+			return d
+	return Vector3.ZERO
+
+
+func test_wading_in_shallow_water() -> void:
+	var sim := Simulation.new()
+	var shallow := _water_dir(sim, 0.2, 0.8)
+	var deep := _water_dir(sim, 2.0, 99.0)
+	var walker_def: Dictionary = EntityKinds.KINDS["explorer"]
+	check(shallow != Vector3.ZERO and deep != Vector3.ZERO, "found shallow and deep water")
+	check(Water.can_be_at(sim.planet, walker_def, shallow), "walkers may wade in shallow water")
+	check(not Water.can_be_at(sim.planet, walker_def, deep), "but not deep water")
+	check(Water.speed_factor(sim.planet, walker_def, shallow) == Water.WADE_SPEED, "wading is slower")
+	check(Water.medium(sim.planet, walker_def, shallow) == "wading", "and shows as wading")
+	check(Water.current_at(sim.planet, shallow + Vector3.ZERO).length() <= Water.MAX_CURRENT * 0.5,
+		"currents are weak near the shore")
+
+
+func test_rafts_float_and_drift() -> void:
+	var sim := Simulation.new()
+	var deep := _water_dir(sim, 3.0, 99.0)
+	var raft := _spawn_one(sim, "raft", deep)
+	check(raft != -1, "a raft can be put on open water")
+	check(_spawn_one(sim, "raft", _land_dir(sim)) == -1, "but not on land")
+	var start := sim.get_entity(raft).dir
+	_run(sim, 400)
+	var e := sim.get_entity(raft)
+	check(e.dir.angle_to(start) * sim.planet.radius > 1.0, "an idle raft drifts with the current")
+	check(Water.depth(sim.planet, e.dir) >= Water.FLOAT_DEPTH, "and stays afloat")
+	check(e.to_dict()["medium"] == "floating", "it shows as floating")
+
+
+func _world_hash_after(sim: Simulation, ticks: int) -> int:
+	_run(sim, ticks)
+	return sim.state_hash()
+
+
+func test_save_and_load() -> void:
+	var sim := Simulation.new({"seed": 5})
+	sim.populate()
+	_run(sim, 100)
+	var save := sim.save_state()
+	var expected := _world_hash_after(sim, 200)
+	var copy := Simulation.new()   # a different (default) seed until loaded
+	check(copy.load_state(bytes_to_var(var_to_bytes(save))) == "", "save loads")
+	check(copy.planet.world_seed == 5, "the planet comes back too")
+	check(_world_hash_after(copy, 200) == expected, "a loaded world carries on exactly as the original")
+	check(Simulation.new().load_state({"version": 999}) != "", "a save from another version is refused")
+
+
+func test_server_save_file() -> void:
+	var server := SimServer.new()
+	server.start({"seed": 9})
+	var agent := ScriptedAgent.new()
+	server.agents.spawn_agent(agent, "explorer", _land_dir(server.sim))
+	server._process(0.2)
+	var count := server.sim.entities.size()
+	var path := "user://test_saves/slot_test.save"
+	check(server.save_game(path) == OK, "server saves to a file")
+	server.submit_command(Commands.despawn(Commands.ADMIN, server.sim.entities.keys()[0]))
+	server._process(0.2)
+	var loaded := [false]
+	server.world_loaded.connect(func() -> void: loaded[0] = true)
+	check(server.load_game(path) == "", "and loads it back")
+	check(loaded[0] and server.sim.entities.size() == count, "the world is as it was saved")
+	check(server.agents.agents.is_empty() and agent.detached_reason != "", "AI agents are let go on load")
+	var body_ctrl := ""
+	for e in server.sim.entities.values():
+		if e.kind == "explorer" and e.controller.begins_with("agent:"):
+			body_ctrl = e.controller
+	check(body_ctrl == "", "saved bodies don't keep agent controllers")
+	check(server.load_game("user://test_saves/missing.save") != "", "a missing save is reported, not a crash")
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+	server.free()

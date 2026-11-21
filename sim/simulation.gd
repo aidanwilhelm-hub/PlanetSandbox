@@ -16,6 +16,12 @@ const Commands = preload("res://sim/commands.gd")
 const EntityKinds = preload("res://sim/entity_kinds.gd")
 const Geo = preload("res://sim/geo.gd")
 const WanderBrain = preload("res://sim/brains/wander_brain.gd")
+const Water = preload("res://sim/water.gd")
+const Physics = preload("res://sim/physics.gd")
+
+const SAVE_VERSION := 1
+## A walker that makes no progress for this many ticks gives up (something is in the way).
+const STUCK_TICKS := 40
 
 var planet: Planet
 var clock: SimClock
@@ -26,11 +32,18 @@ var events: Array[Dictionary] = []       ## what happened during the latest step
 var _next_id := 1
 var _pending: Array[Dictionary] = []
 var _brains: Dictionary = {}             ## brain name -> object with think(sim, entity)
+var _config: Dictionary = {}
 
 
 ## config keys (all optional): seed, radius, max_height, tick_rate, day_length,
 ## year_length_days, axial_tilt, start_hour
 func _init(config: Dictionary = {}) -> void:
+	_configure(config)
+	register_brain("wander", WanderBrain.new())
+
+
+func _configure(config: Dictionary) -> void:
+	_config = config.duplicate(true)
 	var world_seed := int(config.get("seed", 12345))
 	planet = Planet.new(world_seed, float(config.get("radius", 100.0)), float(config.get("max_height", 6.0)))
 	clock = SimClock.new(
@@ -40,7 +53,6 @@ func _init(config: Dictionary = {}) -> void:
 		float(config.get("axial_tilt", 23.0)),
 		float(config.get("start_hour", 9.0)))
 	rng.seed = world_seed
-	register_brain("wander", WanderBrain.new())
 
 
 ## Plug in a built-in behavior by name. Entities whose kind lists this brain use it.
@@ -141,8 +153,11 @@ func _apply_command(cmd: Dictionary) -> String:
 			var target: Variant = Commands.parse_target(cmd.get("target"))
 			if target == null:
 				return "invalid target"
-			if EntityKinds.KINDS[kind]["needs_land"] and not planet.is_land(target):
+			var def: Dictionary = EntityKinds.KINDS[kind]
+			if def["terrain"] == "land" and not planet.is_land(target):
 				return "target is not land"
+			if def["terrain"] == "water" and not Water.can_be_at(planet, def, target):
+				return "target is not open water"
 			_spawn(kind, target, str(cmd.get("controller", "")))
 			return ""
 		Commands.ASSIGN:
@@ -164,8 +179,7 @@ func _apply_command(cmd: Dictionary) -> String:
 				entities.erase(e.id)
 				_emit("entity_despawned", {"entity_id": e.id, "kind": e.kind})
 			elif type == Commands.STOP:
-				e.has_target = false
-				e.state = "idle"
+				_stop(e)
 			elif type == Commands.SAY:
 				var text := str(cmd.get("text", "")).strip_edges()
 				if text == "":
@@ -179,6 +193,8 @@ func _apply_command(cmd: Dictionary) -> String:
 					return "invalid target"
 				e.target_dir = target
 				e.has_target = true
+				e.best_distance = INF
+				e.stuck_ticks = 0
 				e.state = "moving"
 			return ""
 	return "unknown command type '%s'" % type
@@ -195,6 +211,7 @@ func _spawn(kind: String, dir: Vector3, controller: String = "") -> Entity:
 	e.heading = Geo.any_tangent(e.dir)
 	e.speed = def["speed"]
 	e.brain = def["brain"]
+	e.medium = Water.medium(planet, def, e.dir)
 	if controller != "":
 		e.controller = controller
 	elif e.brain != "":
@@ -213,23 +230,128 @@ func _spawn_on_random_land(kind: String) -> void:
 func _move_entities() -> void:
 	var dt := clock.dt()
 	for e: Entity in entities.values():
-		if not e.has_target:
+		var def: Dictionary = EntityKinds.KINDS[e.kind]
+		if not def["mobile"]:
 			continue
-		var next := Geo.rotate_toward(e.dir, e.target_dir, e.speed * dt / planet.radius)
-		if EntityKinds.KINDS[e.kind]["needs_land"] and not planet.is_land(next):
-			e.has_target = false
-			e.state = "idle"
-			_emit("entity_blocked", {"entity_id": e.id, "reason": "water ahead"})
+		if e.has_target:
+			var step: float = e.speed * Water.speed_factor(planet, def, e.dir) * dt
+			var next := Geo.rotate_toward(e.dir, e.target_dir, step / planet.radius)
+			var why := Water.blocked_reason(planet, def, next)
+			if why != "":
+				_stop(e)
+				_emit("entity_blocked", {"entity_id": e.id, "reason": why})
+			else:
+				var moved := next - e.dir
+				if moved.length_squared() > 1e-14:
+					e.heading = moved.normalized()
+				e.dir = next
+				if next == e.target_dir:
+					_stop(e)
+					_emit("entity_arrived", {"entity_id": e.id})
+		if def["terrain"] == "water":
+			# Floating things drift with the current, whatever else they are doing.
+			var drift := Water.current_at(planet, e.dir) * dt
+			var drifted := (e.dir + drift / planet.radius).normalized()
+			if drift != Vector3.ZERO and Water.can_be_at(planet, def, drifted):
+				e.dir = drifted
+		e.position = planet.surface_point(e.dir)
+
+	Physics.resolve(self)
+
+	for e: Entity in entities.values():
+		var def: Dictionary = EntityKinds.KINDS[e.kind]
+		if not def["mobile"]:
 			continue
-		var moved := next - e.dir
-		if moved.length_squared() > 1e-14:
-			e.heading = moved.normalized()
-		e.dir = next
-		e.position = planet.surface_point(next)
-		if next == e.target_dir:
-			e.has_target = false
-			e.state = "idle"
-			_emit("entity_arrived", {"entity_id": e.id})
+		e.medium = Water.medium(planet, def, e.dir)
+		if e.has_target:
+			_check_stuck(e, def)
+
+
+## A walker pressing against something it can't get past (a tree, a crowd)
+## eventually stops. If it is already close to where it was going, that counts
+## as arriving.
+func _check_stuck(e: Entity, def: Dictionary) -> void:
+	var dist := e.dir.angle_to(e.target_dir) * planet.radius
+	if dist < e.best_distance - 0.05:
+		e.best_distance = dist
+		e.stuck_ticks = 0
+		return
+	e.stuck_ticks += 1
+	if e.stuck_ticks < STUCK_TICKS:
+		return
+	_stop(e)
+	if dist <= float(def["radius"]) * 4.0:
+		_emit("entity_arrived", {"entity_id": e.id})
+	else:
+		_emit("entity_blocked", {"entity_id": e.id, "reason": "something in the way"})
+
+
+func _stop(e: Entity) -> void:
+	e.has_target = false
+	e.state = "idle"
+	e.stuck_ticks = 0
+
+
+# --- saving and loading -------------------------------------------------------
+
+## Everything needed to rebuild this exact world later. Players and AI agents
+## are not saved (they are people and programs, not world state): their
+## bodies are kept, handed back to their built-in brain or to nobody.
+func save_state() -> Dictionary:
+	var list: Array = []
+	for e: Entity in entities.values():
+		var ctrl := e.controller
+		if not ctrl.begins_with("brain:"):
+			ctrl = "brain:" + e.brain if e.brain != "" else ""
+		list.append({
+			"id": e.id, "kind": e.kind, "dir": e.dir, "heading": e.heading, "speed": e.speed,
+			"controller": ctrl, "brain": e.brain, "state": e.state, "has_target": e.has_target,
+			"target_dir": e.target_dir, "data": e.data.duplicate(true),
+			"stuck_ticks": e.stuck_ticks, "best_distance": e.best_distance,
+		})
+	return {
+		"version": SAVE_VERSION, "config": _config.duplicate(true), "tick": clock.tick,
+		"next_id": _next_id, "rng_state": rng.state, "entities": list,
+	}
+
+
+## Replace this world with a saved one. Returns "" or what was wrong with it.
+func load_state(save: Dictionary) -> String:
+	if int(save.get("version", 0)) != SAVE_VERSION:
+		return "this save is from a different version of the game"
+	if not save.get("config") is Dictionary or not save.get("entities") is Array:
+		return "the save file is damaged"
+	_configure(save["config"])
+	clock.tick = int(save.get("tick", 0))
+	_next_id = int(save.get("next_id", 1))
+	rng.state = int(save.get("rng_state", rng.state))
+	entities.clear()
+	_pending.clear()
+	events.clear()
+	for d: Variant in save["entities"]:
+		if not d is Dictionary or not EntityKinds.KINDS.has(str(d.get("kind", ""))) \
+				or not d.get("dir") is Vector3 or not (d["dir"] as Vector3).is_normalized():
+			continue
+		var e := Entity.new()
+		e.id = int(d["id"])
+		e.kind = str(d["kind"])
+		e.dir = d.get("dir", Vector3.UP)   # exactly as saved (re-normalizing would nudge it)
+		e.position = planet.surface_point(e.dir)
+		e.heading = d.get("heading", Geo.any_tangent(e.dir))
+		e.speed = float(d.get("speed", EntityKinds.KINDS[e.kind]["speed"]))
+		e.controller = str(d.get("controller", ""))
+		e.brain = str(d.get("brain", ""))
+		e.state = str(d.get("state", "idle"))
+		e.has_target = bool(d.get("has_target", false))
+		e.target_dir = d.get("target_dir", Vector3.ZERO)
+		e.data = d.get("data", {})
+		e.stuck_ticks = int(d.get("stuck_ticks", 0))
+		e.best_distance = float(d.get("best_distance", INF))
+		e.medium = Water.medium(planet, EntityKinds.KINDS[e.kind], e.dir)
+		entities[e.id] = e
+		_next_id = maxi(_next_id, e.id + 1)
+	_emit("world_loaded", {"entities": entities.size()})
+	return ""
 
 
 func _emit(type: String, payload: Dictionary) -> void:

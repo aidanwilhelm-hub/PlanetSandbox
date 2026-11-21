@@ -13,6 +13,8 @@ const AgentRuntime = preload("res://agents/agent_runtime.gd")
 ## Emitted after the sim advances. Carries a full snapshot plus every event
 ## that happened since the previous publish.
 signal snapshot_published(snapshot: Dictionary)
+## A saved world replaced the running one (players need new bodies).
+signal world_loaded
 
 const MAX_STEPS_PER_FRAME := 64
 const MIN_SPEED := 0.25
@@ -51,6 +53,43 @@ func set_paused(value: bool) -> void:
 func set_speed(value: float) -> void:
 	speed = clampf(value, MIN_SPEED, MAX_SPEED)
 	publish()
+
+
+## Save the world to a file (see Simulation.save_state). Returns OK or an error.
+func save_game(path: String) -> int:
+	DirAccess.make_dir_recursive_absolute(path.get_base_dir())
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return FileAccess.get_open_error()
+	var save := sim.save_state()
+	save["saved_at"] = Time.get_datetime_string_from_system(false, true)
+	save["day"] = sim.clock.day_number()
+	f.store_var(save)   # binary, and never stores objects
+	f.close()
+	return OK
+
+
+## Replace the running world with a saved one. Returns "" or what went wrong.
+func load_game(path: String) -> String:
+	if not FileAccess.file_exists(path):
+		return "there is no save there"
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return "couldn't open the save"
+	var save: Variant = f.get_var(false)
+	f.close()
+	if not save is Dictionary:
+		return "the save file is damaged"
+	agents.clear("the world was reloaded")
+	var err := sim.load_state(save)
+	if err != "":
+		return err
+	_accumulator = 0.0
+	_events_since_publish.append_array(sim.events)
+	sim.events.clear()
+	world_loaded.emit()
+	publish()
+	return ""
 
 
 ## Advance exactly one tick (handy while paused).

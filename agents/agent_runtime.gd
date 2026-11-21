@@ -89,6 +89,14 @@ func detach(agent: RefCounted, despawn: bool = false, reason: String = "detached
 	_unbind(agent, reason)
 
 
+## Let go of every agent without touching the world (used when a saved world
+## is loaded: the old bodies are gone). Bridge agents may join again.
+func clear(reason: String) -> void:
+	_waiting_for_spawn.clear()
+	for agent in agents.duplicate():
+		_unbind(agent, reason)
+
+
 func agent_for(entity_id: int) -> RefCounted:
 	for a in agents:
 		if a.entity_id == entity_id:

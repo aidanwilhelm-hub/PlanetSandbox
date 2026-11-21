@@ -14,6 +14,7 @@ var radius: float
 var max_height: float
 
 var _noise := FastNoiseLite.new()
+var _current_noise := FastNoiseLite.new()   ## ocean currents (see sim/water.gd)
 
 
 func _init(p_seed: int = 12345, p_radius: float = 100.0, p_max_height: float = 6.0) -> void:
@@ -27,12 +28,21 @@ func _init(p_seed: int = 12345, p_radius: float = 100.0, p_max_height: float = 6
 	_noise.fractal_octaves = 5
 	_noise.fractal_lacunarity = 2.0
 	_noise.fractal_gain = 0.5
+	_current_noise.seed = p_seed + 1
+	_current_noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	_current_noise.frequency = 0.6
 
 
 ## Terrain height relative to sea level (negative = under water).
 func height_at(dir: Vector3) -> float:
 	var n := _noise.get_noise_3dv(dir.normalized())
 	return clampf(n * 1.8 + 0.05, -1.0, 1.0) * max_height
+
+
+## Smooth noise in 0..1 for the ocean currents; `channel` picks an independent field.
+func current_noise(dir: Vector3, channel: int) -> float:
+	var p := dir.normalized() + Vector3(channel * 7.3, channel * 3.1, 0.0)
+	return clampf(_current_noise.get_noise_3dv(p) * 0.5 + 0.5, 0.0, 1.0)
 
 
 func is_land(dir: Vector3) -> bool:

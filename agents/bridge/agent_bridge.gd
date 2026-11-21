@@ -3,7 +3,8 @@
 ## Start the game with `-- --agent-port=7777` and any language can connect to
 ## 127.0.0.1:7777 and send one JSON object per line:
 ##
-##   -> {"op": "join", "name": "bob", "kind": "explorer"}       spawn a body on random land
+##   -> {"op": "join", "name": "bob", "kind": "explorer", "password": "..."}
+##      spawn a body on random land ("password" only if the server set one)
 ##      (optional: "lat"/"lon" to choose where, "entity_id" to take over an
 ##       existing entity instead, "think_every" ticks, "sight_range" meters)
 ##   <- {"op": "joined", "entity_id": 42, "controller": "agent:bob:3"}
@@ -19,8 +20,11 @@
 ##
 ## See examples/agents/ for Python clients, including one driven by Claude.
 ##
-## Only listens on 127.0.0.1 (this computer). Step 3 (multiplayer) carries the
-## same messages over the real network.
+## Without a server password it only listens on 127.0.0.1 (this computer).
+## With one (`-- --password=...`), other computers may connect too, and every
+## join must carry the password. After 10 wrong passwords from one address it
+## is refused for 10 minutes (see net/auth_guard.gd; the multiplayer server
+## shares the same count).
 extends Node
 
 const RemoteAgent = preload("res://agents/bridge/remote_agent.gd")
@@ -30,6 +34,8 @@ const MAX_CLIENTS := 32
 
 var runtime: RefCounted
 var port := 0
+## An AuthGuard (net/auth_guard.gd), or null for no password.
+var guard: RefCounted = null
 
 var _server := TCPServer.new()
 var _clients: Array = []      ## [{peer, buffer, agent}]
@@ -46,7 +52,8 @@ func _init(p_runtime: RefCounted) -> void:
 ## Returns OK or an Error code.
 func listen(p_port: int) -> int:
 	port = p_port
-	return _server.listen(port, "127.0.0.1")
+	var open_to_network: bool = guard != null and guard.is_required()
+	return _server.listen(port, "*" if open_to_network else "127.0.0.1")
 
 
 func _exit_tree() -> void:
@@ -89,6 +96,8 @@ func _read_lines(c: Dictionary) -> void:
 		buf = buf.slice(nl + 1)
 		if line != "":
 			_handle(c, line)
+		if not _clients.has(c):
+			return   # dropped (e.g. wrong password)
 	c["buffer"] = buf
 
 
@@ -116,6 +125,15 @@ func _join(c: Dictionary, msg: Dictionary) -> void:
 	if c["agent"] != null:
 		_send(c, {"op": "error", "message": "already joined"})
 		return
+	if guard != null and guard.is_required():
+		var address := (c["peer"] as StreamPeerTCP).get_connected_host()
+		var verdict: String = guard.check(address, str(msg.get("password", "")))
+		if verdict != "ok":
+			var why := "wrong password" if verdict == "wrong" else \
+				"too many wrong passwords; try again in %d minutes" % guard.minutes_left(address)
+			_send(c, {"op": "error", "message": why})
+			_drop(c, why)
+			return
 	var agent := RemoteAgent.new()
 	agent.peer = c["peer"]
 	agent.agent_name = str(msg.get("name", "remote")).left(32)
