@@ -34,6 +34,7 @@ const WorldView = preload("res://client/world_view.gd")
 const LocalLink = preload("res://client/local_link.gd")
 const RemoteLink = preload("res://client/remote_link.gd")
 const MainMenu = preload("res://client/main_menu.gd")
+const Settings = preload("res://client/settings.gd")
 
 const SIM_MODE_AGENTS := 8
 
@@ -45,6 +46,7 @@ var menu: MainMenu
 
 
 func _ready() -> void:
+	Settings.apply_window()
 	var opts := _parse_args(OS.get_cmdline_user_args())
 	if opts["launch"] == "menu":
 		_show_menu("")
@@ -199,6 +201,8 @@ func _open_view() -> void:
 	view.name = "WorldView"
 	add_child(view)
 	view.setup(link)
+	view.exit_requested.connect(func() -> void: _back_to_menu(""))
+	view.quit_requested.connect(func() -> void: get_tree().quit())
 
 
 func _back_to_menu(reason: String) -> void:

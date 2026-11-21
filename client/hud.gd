@@ -8,19 +8,21 @@ signal mod_toggled(peer_id: int, on: bool)
 
 const HELP_ADMIN := """Left-drag / arrows: spin   Scroll: zoom
 Left-click: select   Right-click: move selected here
-N: spawn critter   T: tree   E: explorer   A: AI explorer   Del: remove selected
-F: focus selected   Tab: follow next AI   G: auto-follow
-Space: pause   + / -: speed   . : step (paused)   Enter: chat   P: players"""
+N: critter   T: tree   E: explorer   B: raft   A: AI explorer   Del: remove selected
+F: focus selected   Tab: follow next AI   G: auto-follow   Zoom all the way in: first person
+Space: pause   + / -: speed   . : step (paused)   Enter: chat   P: players   Esc: menu"""
 const HELP_PLAYER := """Left-drag / arrows: spin   Scroll: zoom
 Right-click: walk there   F: find your explorer   Enter: chat
-Left-click: select   Tab: follow next AI   G: auto-follow   P: players"""
+Zoom all the way in: first person (W walk, S stop)
+Left-click: select   Tab: follow next AI   G: auto-follow   P: players   Esc: menu"""
 const HELP_CREATIVE := """
-N: spawn critter   T: tree   E: explorer   A: AI explorer   Del: remove selected"""
+N: critter   T: tree   E: explorer   B: raft   A: AI explorer   Del: remove selected"""
 const HELP_MOD := """
 Space: pause   + / -: speed   . : step (paused)"""
 const HELP_SPECTATOR := """Left-drag / arrows: spin   Scroll: zoom
-Tab: follow next AI   G: auto-follow on/off   Esc: stop following
-Left-click: select   F: focus selected   P: players"""
+Tab: follow next AI   G: auto-follow on/off   Esc: stop following / menu
+Left-click: select   F: focus selected   P: players
+Zoom all the way in: see through the followed AI's eyes"""
 const HELP_LOCAL_TIME := """
 Space: pause   + / -: speed   . : step (paused)"""
 
@@ -96,6 +98,10 @@ func set_help(link: Node) -> void:
 		_:
 			text = ""
 	_help.text = text
+
+
+func set_help_visible(on: bool) -> void:
+	_help.visible = on
 
 
 func show_status(snap: Dictionary, link: Node) -> void:

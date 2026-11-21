@@ -90,3 +90,22 @@ func role_label() -> String:
 		"player":
 			return "player, moderator" if is_mod else "player"
 	return "spectator"
+
+
+## Saving and loading the world: only when it runs on this computer.
+func can_save() -> bool:
+	return false
+
+
+## A short description of what's in a save slot ("" = empty).
+func slot_info(_slot: int) -> String:
+	return ""
+
+
+## Returns "" or what went wrong.
+func save_slot(_slot: int) -> String:
+	return "saving isn't possible here"
+
+
+func load_slot(_slot: int) -> String:
+	return "loading isn't possible here"

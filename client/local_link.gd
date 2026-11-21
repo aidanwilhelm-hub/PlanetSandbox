@@ -87,3 +87,40 @@ func set_mod(peer_id: int, on: bool) -> void:
 ## while only watching.
 func can_control_time() -> bool:
 	return true
+
+
+func can_save() -> bool:
+	return true
+
+
+static func slot_path(slot: int) -> String:
+	return "user://saves/slot_%d.save" % slot
+
+
+func slot_info(slot: int) -> String:
+	var path := slot_path(slot)
+	if not FileAccess.file_exists(path):
+		return ""
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return ""
+	var save: Variant = f.get_var(false)
+	if not save is Dictionary:
+		return "damaged"
+	var when := str(save.get("saved_at", "")).replace("T", " ").left(16)
+	return "%s   day %d   %d things" % [when, int(save.get("day", 0)), (save.get("entities", []) as Array).size()]
+
+
+func save_slot(slot: int) -> String:
+	var err: int = server.save_game(slot_path(slot))
+	if err != OK:
+		return error_string(err)
+	notice.emit("Saved the world to slot %d." % slot)
+	return ""
+
+
+func load_slot(slot: int) -> String:
+	var err: String = server.load_game(slot_path(slot))
+	if err == "":
+		notice.emit("Loaded slot %d." % slot)
+	return err

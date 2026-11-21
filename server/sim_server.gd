@@ -63,6 +63,7 @@ func save_game(path: String) -> int:
 		return FileAccess.get_open_error()
 	var save := sim.save_state()
 	save["saved_at"] = Time.get_datetime_string_from_system(false, true)
+	save["day"] = sim.clock.day_number()
 	f.store_var(save)   # binary, and never stores objects
 	f.close()
 	return OK

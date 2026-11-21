@@ -39,7 +39,7 @@ A start menu opens. **Play alone** puts you on the planet as before;
 | Do this | To |
 |---|---|
 | Left-drag, or arrow keys | Spin around the planet |
-| Mouse wheel | Zoom in / out |
+| Mouse wheel | Zoom in / out (all the way in: first person) |
 | Left-click a thing | Select it (a yellow ring appears) |
 | Right-click the ground | Send the selected thing walking there |
 | **N** / **T** / **E** | Spawn a critter / tree / explorer where the mouse points |
@@ -53,7 +53,9 @@ A start menu opens. **Play alone** puts you on the planet as before;
 | **Tab** | Follow the next AI explorer with the camera |
 | **G** | Auto-follow: the camera picks which AI to watch |
 | **P** | Show the player list (multiplayer) |
-| **Esc** | Stop following / deselect |
+| **B** | Put a raft on the water where the mouse points |
+| **W** / **S** | In first person: walk forward / stop |
+| **Esc** | Stop following / deselect; press again for the menu |
 
 What lives here right now:
 
@@ -62,8 +64,30 @@ What lives here right now:
   things now and then (speech bubbles, and a line in the log).
 - **Critter** (orange): wanders nearby by day, stops when its spot goes dark.
 - **Tree** (green cone): scenery; it refuses to move.
+- **Raft** (brown, with a sail; **B** over water): floats, drifts with the
+  ocean currents, and can be sailed anywhere there is open water.
 
-Walkers can't swim: if a path crosses water they stop at the shore.
+**Bumping into things.** Everything takes up room. Walkers can't pass
+through trees or each other: they get pushed aside and slide around, and if
+something blocks the way for a couple of seconds they give up (or, if they
+were nearly there, count it as arriving).
+
+**Water.** Walkers wade through shallow water (up to 1 m deep) at half speed
+and stop where it gets deeper. Rafts need open water and stop at the shore.
+The sea has currents, strongest far from land, that slowly carry anything
+floating. The waves you see are just for looks.
+
+**Menu (Esc).** Resume, settings (mouse sensitivity, field of view,
+fullscreen, shadows, speech bubbles, the controls list, first person), save
+and load (three slots; only when the world runs on your computer), exit to
+the main menu, and quit. Playing alone, the world pauses while the menu is open.
+Settings are remembered between runs.
+
+**First person.** Zoom all the way in while something is selected (or, in
+multiplayer, any time: it's your own explorer) and scroll in once more: you
+look out of its eyes. Drag to look around, **W** walks 10 m the way you're
+looking, **S** stops, and scrolling out (or Esc) goes back to the orbit view.
+Watching an AI world, it puts you behind the eyes of the agent you're following.
 
 A full day is 2 minutes of real time at x1 speed, and a year is 8 days, so the
 sun drifts north and south as the seasons change.
@@ -130,6 +154,8 @@ and the screen never changes the simulation directly.**
     sent over the network.
   - `sim_clock.gd`: ticks, days, the sun's position, seasons.
   - `entity.gd`, `entity_kinds.gd`: what a "thing" is, and the catalog of kinds.
+  - `physics.gd`: collisions (things push each other apart).
+  - `water.gd`: wading, floating, currents.
   - `commands.gd`: the only ways to change the world: `spawn`, `despawn`,
     `say` (an entity speaks), `assign` (admin hands an entity to a player or agent),
     `move_to`, `stop`.

@@ -15,8 +15,16 @@ const EntityVisuals = preload("res://client/entity_visuals.gd")
 const OrbitCamera = preload("res://client/orbit_camera.gd")
 const Hud = preload("res://client/hud.gd")
 const SpectatorControls = preload("res://client/spectator_controls.gd")
+const GameMenu = preload("res://client/game_menu.gd")
+const Settings = preload("res://client/settings.gd")
+const Geo = preload("res://sim/geo.gd")
+
+## The in-game menu asked to leave.
+signal exit_requested
+signal quit_requested
 
 const CLICK_PICK_PIXELS := 22.0
+const SPACE_COLOR := Color(0.01, 0.015, 0.03)
 
 var link: Node              ## a server link (local or remote)
 var planet: Planet          ## a local copy, rebuilt from the seed, for drawing and mouse picking
@@ -33,6 +41,12 @@ var _snapshot: Dictionary = {}
 var _ring: MeshInstance3D
 var _focused_once := false
 var _focus_own := true
+var menu: GameMenu
+var _time := 0.0
+var _paused_by_menu := false
+var _terrain: Node3D
+var _env: Environment
+var _ocean: Node3D
 
 
 func setup(p_link: Node) -> void:
@@ -50,7 +64,53 @@ func setup(p_link: Node) -> void:
 	hud.mod_toggled.connect(func(id: int, on: bool) -> void: link.set_mod(id, on))
 	hud.set_help(link)
 	_refresh_players()
+	menu = GameMenu.new(link)
+	menu.name = "GameMenu"
+	add_child(menu)
+	menu.closed.connect(_on_menu_closed)
+	menu.exit_to_menu.connect(func() -> void: exit_requested.emit())
+	menu.quit_game.connect(func() -> void: quit_requested.emit())
+	camera.first_person_changed.connect(_on_first_person_changed)
+	Settings.listen(_on_setting_changed)
+	for key: String in Settings.DEFAULTS:
+		_on_setting_changed(key)
 	link.publish()
+
+
+func _on_setting_changed(key: String) -> void:
+	if not is_instance_valid(self):
+		return
+	match key:
+		"fov":
+			camera.fov = float(Settings.get_value("fov"))
+		"shadows":
+			sun.shadow_enabled = bool(Settings.get_value("shadows"))
+		"show_help":
+			hud.set_help_visible(bool(Settings.get_value("show_help")))
+		"first_person":
+			if not Settings.get_value("first_person"):
+				camera.set_first_person(false)
+
+
+func open_menu() -> void:
+	if menu.visible:
+		return
+	# Playing alone (or watching your own AI world), the world waits for you.
+	if not link.networked and link.can_control_time() and not link.paused:
+		_paused_by_menu = true
+		link.set_paused(true)
+	menu.open()
+
+
+func _on_menu_closed() -> void:
+	if _paused_by_menu:
+		_paused_by_menu = false
+		link.set_paused(false)
+
+
+func _on_first_person_changed(on: bool) -> void:
+	hud.log_line("First person: drag to look around, W to walk forward, S to stop, scroll out to leave"
+		if on else "Back to orbit view")
 
 
 func _on_identity_changed() -> void:
@@ -66,11 +126,12 @@ func _refresh_players() -> void:
 func _build_scene() -> void:
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.01, 0.015, 0.03)
+	env.background_color = SPACE_COLOR
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	env.ambient_light_color = Color(0.35, 0.42, 0.6)
 	env.ambient_light_energy = 0.25
 	env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+	_env = env
 	var world_env := WorldEnvironment.new()
 	world_env.environment = env
 	add_child(world_env)
@@ -103,12 +164,25 @@ func _build_scene() -> void:
 
 
 func _build_planet(info: Dictionary) -> void:
+	# A loaded save can bring a different planet: start the picture over.
+	for n in [_terrain, _ocean]:
+		if n != null:
+			n.queue_free()
+	for id: int in _visuals:
+		_visuals[id].queue_free()
+	_visuals.clear()
+	_latest.clear()
+	_select(-1)
+	follow_id = -1
+	camera.set_first_person(false)
 	planet = Planet.new(int(info["seed"]), float(info["radius"]), float(info["max_height"]))
 	var terrain := MeshInstance3D.new()
 	terrain.name = "Terrain"
 	terrain.mesh = MeshBuilder.build(planet)
 	add_child(terrain)
-	add_child(MeshBuilder.build_ocean(planet))
+	_terrain = terrain
+	_ocean = MeshBuilder.build_ocean(planet)
+	add_child(_ocean)
 	camera.planet_radius = planet.radius
 	camera.distance = planet.radius * 2.4
 
@@ -116,7 +190,7 @@ func _build_planet(info: Dictionary) -> void:
 # --- drawing snapshots -------------------------------------------------------
 
 func _on_snapshot(snap: Dictionary) -> void:
-	if planet == null:
+	if planet == null or planet.world_seed != int(snap["planet"]["seed"]):
 		_build_planet(snap["planet"])
 	_snapshot = snap
 
@@ -161,21 +235,47 @@ func _on_snapshot(snap: Dictionary) -> void:
 
 
 func _process(delta: float) -> void:
+	_time += delta
 	var blend := clampf(delta * 12.0, 0.0, 1.0)
+	var fp_id := first_person_subject()
+	camera.fp_subject = _visuals.get(fp_id)
+	var animate_time := 0.0 if link.paused else delta
 	for id: int in _visuals:
 		var node: Node3D = _visuals[id]
 		var e: Dictionary = _latest[id]
 		node.position = node.position.lerp(e["position"], blend)
 		_orient(node, e["heading"])
+		EntityVisuals.animate(node, e["kind"], e["state"] == "moving", str(e.get("medium", "dry")),
+			animate_time, _time)
+		# In first person you are inside this one: hide it so it doesn't block the view.
+		node.visible = not (camera.first_person and id == fp_id)
 		var speech := node.get_node_or_null("Speech") as Label3D
 		if speech != null:
 			speech.visible = (camera.global_position - node.position).dot(node.position) > 0.0
 	if follow_id != -1 and _visuals.has(follow_id):
 		camera.focus_on(_visuals[follow_id].position)
+	_update_sky(fp_id)
+	_ring.visible = selected_id != -1 and not (camera.first_person and selected_id == fp_id)
 	if selected_id != -1 and _visuals.has(selected_id):
 		var n: Node3D = _visuals[selected_id]
 		_ring.transform = n.transform
 		_ring.position += n.basis.y * 0.15
+
+
+## From space the background is black; standing on the ground (first person)
+## you see a sky: blue by day, orange at dusk, dark at night.
+func _update_sky(fp_id: int) -> void:
+	if not camera.first_person or not _visuals.has(fp_id) or _snapshot.is_empty():
+		_env.background_color = SPACE_COLOR
+		return
+	var up: Vector3 = _visuals[fp_id].position.normalized()
+	var sun_height: float = up.dot(_snapshot["time"]["sun_direction"])
+	var day := Color(0.45, 0.68, 0.95)
+	var dusk := Color(0.85, 0.5, 0.3)
+	var night := Color(0.02, 0.03, 0.08)
+	var c := night.lerp(dusk, clampf((sun_height + 0.15) / 0.2, 0.0, 1.0))
+	c = c.lerp(day, clampf((sun_height - 0.05) / 0.25, 0.0, 1.0))
+	_env.background_color = _env.background_color.lerp(c, 0.1)
 
 
 ## Stand the node up on the surface and face it along `heading`.
@@ -237,6 +337,14 @@ func _unhandled_input(event: InputEvent) -> void:
 				_spawn_at_mouse("tree")
 			KEY_E:
 				_spawn_at_mouse("explorer")
+			KEY_B:
+				_spawn_at_mouse("raft")
+			KEY_W:
+				if camera.first_person:
+					_walk_forward()
+			KEY_S:
+				if camera.first_person and _my_walker() != -1:
+					link.submit_command(Commands.stop(link.issuer, first_person_subject()))
 			KEY_A:
 				_spawn_agent_at_mouse()
 			KEY_DELETE, KEY_BACKSPACE, KEY_X:
@@ -269,8 +377,38 @@ func _unhandled_input(event: InputEvent) -> void:
 				if link.paused:
 					link.step_once()
 			KEY_ESCAPE:
-				stop_following()
-				_select(-1)
+				if camera.first_person:
+					camera.set_first_person(false)
+				elif follow_id != -1 or selected_id != -1:
+					stop_following()
+					_select(-1)
+				else:
+					open_menu()
+
+
+## Whose eyes first person looks out of: your own explorer, else the one the
+## camera follows, else the selected one (-1 = none).
+func first_person_subject() -> int:
+	if link.role == "player" and link.my_entity_id != -1:
+		return link.my_entity_id
+	if follow_id != -1:
+		return follow_id
+	return selected_id
+
+
+## First person: walk 10 m the way you are looking (if it's yours to command).
+func _walk_forward() -> void:
+	var id := first_person_subject()
+	if not _latest.has(id) or not (link.role == "admin" or str(_latest[id]["controller"]) == link.issuer):
+		return
+	var here: Vector3 = (_latest[id]["dir"] as Vector3)
+	var look := camera.look_direction()
+	look -= here * look.dot(here)
+	if look.length_squared() < 1e-6:
+		return
+	var bearing := Geo.heading_to_bearing_deg(here, look.normalized())
+	var target := Geo.destination(here, bearing, 10.0 / planet.radius)
+	link.submit_command(Commands.move_to(link.issuer, id, target))
 
 
 ## The entity a right-click should send walking: a player's own explorer, or
@@ -356,7 +494,7 @@ func speaker_name(id: int) -> String:
 
 ## A speech bubble over an entity's head for a few seconds.
 func _show_speech(id: int, text: String) -> void:
-	if not _visuals.has(id):
+	if not _visuals.has(id) or not Settings.get_value("speech_bubbles"):
 		return
 	var node: Node3D = _visuals[id]
 	var old := node.get_node_or_null("Speech")
@@ -374,7 +512,7 @@ func _show_speech(id: int, text: String) -> void:
 	label.width = 500.0
 	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	label.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
-	label.position = Vector3(0, 2.0, 0)
+	label.position = Vector3(0, 3.3, 0)
 	node.add_child(label)
 	# Bound to the label itself, so the connection simply vanishes if the label
 	# is replaced by a newer bubble first.
@@ -383,7 +521,6 @@ func _show_speech(id: int, text: String) -> void:
 
 func _select(id: int) -> void:
 	selected_id = id
-	_ring.visible = id != -1
 	_refresh_selected_info()
 
 
