@@ -8,6 +8,7 @@
 extends Node
 
 const Simulation = preload("res://sim/simulation.gd")
+const AgentRuntime = preload("res://agents/agent_runtime.gd")
 
 ## Emitted after the sim advances. Carries a full snapshot plus every event
 ## that happened since the previous publish.
@@ -18,6 +19,8 @@ const MIN_SPEED := 0.25
 const MAX_SPEED := 32.0
 
 var sim: Simulation
+## AI agent NPCs run here, on the server, next to the simulation.
+var agents: AgentRuntime
 var paused := false
 var speed := 1.0   ## 1.0 = real time; 4.0 = four times faster
 
@@ -27,6 +30,7 @@ var _events_since_publish: Array = []
 
 func start(config: Dictionary = {}, populate: bool = true) -> void:
 	sim = Simulation.new(config)
+	agents = AgentRuntime.new(sim, submit_command)
 	if populate:
 		sim.populate()
 	_events_since_publish.append_array(sim.events)
@@ -51,8 +55,7 @@ func set_speed(value: float) -> void:
 
 ## Advance exactly one tick (handy while paused).
 func step_once() -> void:
-	sim.step()
-	_events_since_publish.append_array(sim.events)
+	_step()
 	publish()
 
 
@@ -71,11 +74,17 @@ func _process(delta: float) -> void:
 	_accumulator += delta * speed * sim.clock.tick_rate
 	var steps := 0
 	while _accumulator >= 1.0 - 1e-6 and steps < MAX_STEPS_PER_FRAME:
-		sim.step()
-		_events_since_publish.append_array(sim.events)
+		_step()
 		_accumulator -= 1.0
 		steps += 1
 	if steps == MAX_STEPS_PER_FRAME:
 		_accumulator = 0.0  # running behind; drop the backlog instead of spiraling
 	if steps > 0:
 		publish()
+
+
+## One tick: the world advances, then agents observe it and queue their next moves.
+func _step() -> void:
+	sim.step()
+	_events_since_publish.append_array(sim.events)
+	agents.tick()

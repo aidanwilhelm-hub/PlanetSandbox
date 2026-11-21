@@ -3,7 +3,7 @@ extends CanvasLayer
 
 const HELP := """Left-drag / arrows: spin   Scroll: zoom
 Left-click: select   Right-click: move selected here
-N: spawn critter   T: tree   E: explorer   Del: remove selected
+N: spawn critter   T: tree   E: explorer   A: AI explorer   Del: remove selected
 F: focus selected   Space: pause   + / -: speed   . : step (paused)"""
 
 var _status: Label
