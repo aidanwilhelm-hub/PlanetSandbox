@@ -12,6 +12,7 @@ const MeshBuilder = preload("res://client/planet_mesh_builder.gd")
 const EntityVisuals = preload("res://client/entity_visuals.gd")
 const OrbitCamera = preload("res://client/orbit_camera.gd")
 const Hud = preload("res://client/hud.gd")
+const CuriousAgent = preload("res://agents/examples/curious_agent.gd")
 
 ## In single-player the person at the keyboard is the admin.
 const ISSUER := Commands.ADMIN
@@ -29,6 +30,7 @@ var _latest: Dictionary = {}    ## entity id -> latest entity dict from the serv
 var _snapshot: Dictionary = {}
 var _ring: MeshInstance3D
 var _focused_once := false
+var _agent_count := 0
 
 
 func setup(p_server: Node) -> void:
@@ -133,6 +135,9 @@ func _process(delta: float) -> void:
 		var e: Dictionary = _latest[id]
 		node.position = node.position.lerp(e["position"], blend)
 		_orient(node, e["heading"])
+		var speech := node.get_node_or_null("Speech") as Label3D
+		if speech != null:
+			speech.visible = (camera.global_position - node.position).dot(node.position) > 0.0
 	if selected_id != -1 and _visuals.has(selected_id):
 		var n: Node3D = _visuals[selected_id]
 		_ring.transform = n.transform
@@ -162,6 +167,9 @@ func _log_event(ev: Dictionary) -> void:
 		"entity_blocked":
 			if ev["entity_id"] == selected_id:
 				hud.log_line("#%d stopped: %s" % [ev["entity_id"], ev["reason"]])
+		"entity_said":
+			hud.log_line("#%d says: \"%s\"" % [ev["entity_id"], ev["text"]])
+			_show_speech(ev["entity_id"], ev["text"])
 
 
 # --- input -> commands --------------------------------------------------------
@@ -186,6 +194,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				_spawn_at_mouse("tree")
 			KEY_E:
 				_spawn_at_mouse("explorer")
+			KEY_A:
+				_spawn_agent_at_mouse()
 			KEY_DELETE, KEY_BACKSPACE, KEY_X:
 				if selected_id != -1:
 					server.submit_command(Commands.despawn(ISSUER, selected_id))
@@ -211,6 +221,43 @@ func _spawn_at_mouse(kind: String) -> void:
 		hud.log_line("! point the mouse at the planet to spawn")
 		return
 	server.submit_command(Commands.spawn(ISSUER, kind, target))
+
+
+## Spawn an explorer run by the example "curious" AI agent.
+func _spawn_agent_at_mouse() -> void:
+	var target: Variant = _pick_ground(get_viewport().get_mouse_position())
+	if target == null:
+		hud.log_line("! point the mouse at the planet to spawn")
+		return
+	_agent_count += 1
+	server.agents.spawn_agent(CuriousAgent.new(_agent_count), "explorer", target)
+
+
+## A speech bubble over an entity's head for a few seconds.
+func _show_speech(id: int, text: String) -> void:
+	if not _visuals.has(id):
+		return
+	var node: Node3D = _visuals[id]
+	var old := node.get_node_or_null("Speech")
+	if old != null:
+		old.free()
+	var label := Label3D.new()
+	label.name = "Speech"
+	label.text = text
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.fixed_size = true          # same size on screen however far the camera is
+	label.no_depth_test = true       # never hidden by hills; _process hides it on the far side
+	label.pixel_size = 0.0008
+	label.font_size = 28
+	label.outline_size = 8
+	label.width = 500.0
+	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	label.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
+	label.position = Vector3(0, 2.0, 0)
+	node.add_child(label)
+	# Bound to the label itself, so the connection simply vanishes if the label
+	# is replaced by a newer bubble first.
+	get_tree().create_timer(4.0).timeout.connect(label.queue_free)
 
 
 func _select(id: int) -> void:

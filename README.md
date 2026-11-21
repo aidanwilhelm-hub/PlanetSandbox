@@ -7,10 +7,10 @@ them, and send them walking across the planet.
 
 ![The planet](docs/screenshot.png)
 
-This is **step 1 of 4**. It is built so the next steps slot in cleanly:
+This is **step 2 of 4**. It is built so the next steps slot in cleanly:
 
-1. **Core simulation** (this): planet, terrain, time, entities, commands.
-2. **AI agent NPCs**: any AI model or scripted bot can observe the world and send commands.
+1. **Core simulation**: planet, terrain, time, entities, commands.
+2. **AI agent NPCs** (this): any AI model or scripted bot can drive an NPC. See [AI agent NPCs](#ai-agent-npcs).
 3. **Multiplayer** and a hands-off "just watch" sim mode.
 4. **Game mode** with goals and progression.
 
@@ -41,6 +41,7 @@ A window opens showing the planet.
 | Left-click a thing | Select it (a yellow ring appears) |
 | Right-click the ground | Send the selected thing walking there |
 | **N** / **T** / **E** | Spawn a critter / tree / explorer where the mouse points |
+| **A** | Spawn an AI-driven explorer (the example "curious" agent) where the mouse points |
 | **Delete** (or **X**) | Remove the selected thing |
 | **F** | Point the camera at the selected thing |
 | **Space** | Pause / resume |
@@ -51,7 +52,8 @@ A window opens showing the planet.
 What lives here right now:
 
 - **Explorer** (cyan, with a white nose): has no mind of its own. It walks
-  wherever you send it. In step 2, AI agents will drive these.
+  wherever you send it, unless an AI agent is driving it. AI explorers say
+  things now and then (speech bubbles, and a line in the log).
 - **Critter** (orange): wanders nearby by day, stops when its spot goes dark.
 - **Tree** (green cone): scenery; it refuses to move.
 
@@ -72,6 +74,12 @@ godot --headless --path . -- --server
 
 # Try a different planet
 godot --path . -- --seed=42
+
+# Start with 5 AI explorers already roaming.
+godot --path . -- --agents=5
+
+# Let outside programs (Python, an LLM...) drive NPCs. See "AI agent NPCs" below.
+godot --path . -- --agent-port=7777
 
 # Run the automated tests (no window). Prints PASS/FAIL per test.
 godot --headless --path . --script res://tests/run_tests.gd
@@ -105,10 +113,13 @@ and the screen never changes the simulation directly.**
     sent over the network.
   - `sim_clock.gd`: ticks, days, the sun's position, seasons.
   - `entity.gd`, `entity_kinds.gd`: what a "thing" is, and the catalog of kinds.
-  - `commands.gd`: the only four ways to change the world: `spawn`, `despawn`,
+  - `commands.gd`: the only ways to change the world: `spawn`, `despawn`,
+    `say` (an entity speaks), `assign` (admin hands an entity to a player or agent),
     `move_to`, `stop`.
   - `brains/wander_brain.gd`: the critters' behavior. It doesn't move critters
     itself; it *sends commands* like anyone else would.
+- **`agents/`**: the AI agent NPC layer (see below). Runs on the server, next
+  to the simulation, and only ever talks to it through commands.
 - **`server/sim_server.gd`**: runs the sim on a steady clock, handles pause and
   speed, and publishes snapshots.
 - **`client/`**: everything you see: planet mesh, ocean, sun, camera, labels.
@@ -124,6 +135,8 @@ packet, or an AI model's JSON output:
 {"type": "spawn",   "issuer": "admin", "kind": "critter", "target": {"lat": -20, "lon": 100}}
 {"type": "stop",    "issuer": "player:alice", "entity_id": 7}
 {"type": "despawn", "issuer": "admin", "entity_id": 7}
+{"type": "say",     "issuer": "agent:bob:1", "entity_id": 7, "text": "hello!"}
+{"type": "assign",  "issuer": "admin", "entity_id": 7, "controller": "player:alice"}
 ```
 
 Every command says who sent it (`issuer`). Each entity has a `controller`, and
@@ -133,13 +146,128 @@ the sim. In single-player, you are `admin`.
 
 ### Why this sets up the next steps
 
-- **AI agents (step 2):** an agent reads a snapshot (it converts straight to
-  JSON), decides, and sends commands. It gets its own `controller` name so it
-  can only move its own explorer. The wander brain is a working example of this
-  loop already.
+- **AI agents (step 2, done):** see [AI agent NPCs](#ai-agent-npcs) below.
 - **Multiplayer (step 3):** the server already accepts commands from "anyone"
-  and publishes snapshots. Step 3 adds the network pipe between them. The sim is
+  and publishes snapshots. Agents already live on the server and go through
+  the same permission rules as players, so they work unchanged in multiplayer. Step 3 adds the network pipe between them. The sim is
   deterministic (same seed + same commands = same world, checked by a test), and
   a "watch-only" viewer is simply a client that never sends commands.
 - **Adding content:** a new creature is one line in `sim/entity_kinds.gd` plus
   (optionally) a look in `client/entity_visuals.gd`.
+
+---
+
+## AI agent NPCs
+
+An agent is anything that can **observe, decide, act**:
+
+1. **Observe.** Every few ticks the agent gets a small JSON-friendly picture of
+   what its NPC can perceive: where it is, the time of day, what's nearby
+   (with distance and compass bearing), how much walkable land lies in each
+   direction, what happened to it since last time (arrived, blocked by water,
+   heard someone speak), and feedback on any actions that didn't work.
+2. **Decide.** Your code (a few `if`s, a Python script, an LLM...) picks
+   actions.
+3. **Act.** The actions become ordinary commands under the agent's own
+   controller name, so an agent can only ever move **its own body**, and the
+   same rules apply to it as to a human player.
+
+### A whole agent in GDScript
+
+```gdscript
+extends "res://agents/agent.gd"
+
+func decide(obs: Dictionary) -> Variant:
+    if not obs["time"]["is_day"]:
+        return {"action": "stop"}
+    return {"action": "move", "bearing": randf() * 360.0, "distance": 15}
+```
+
+Put it to work (for example in `main.gd`, after `server.start()`):
+
+```gdscript
+server.agents.spawn_agent(MyAgent.new(), "explorer", {"lat": 10, "lon": 20})
+# or take over something that already exists:
+server.agents.attach(MyAgent.new(), some_entity_id)
+```
+
+Optional knobs on an agent: `think_every` (ticks between decisions, default 10,
+i.e. twice a second), `sight_range` (meters, default 30), and the hooks
+`on_attached(obs)` / `on_detached(reason)`. Taking over a critter switches off
+its built-in wander brain until the agent lets go.
+
+**Slow thinkers** (an LLM call takes seconds): set `busy = true` in `decide()`,
+return `null`, and call `act(actions)` when the answer arrives. The NPC keeps
+doing what it was last told meanwhile, and the agent isn't asked again until
+it has answered.
+
+### Actions
+
+| Action | Example | Does |
+|---|---|---|
+| `move_to` | `{"action": "move_to", "lat": 10, "lon": 45}` | walk to a place |
+| `move` | `{"action": "move", "bearing": 90, "distance": 20}` | walk 20 m east (0 = north) |
+| `approach` | `{"action": "approach", "entity_id": 12}` | walk to where #12 is now |
+| `stop` | `{"action": "stop"}` | stand still |
+| `say` | `{"action": "say", "text": "hello!"}` | speak; agents within sight range hear it |
+| `wait` | `{"action": "wait"}` | nothing |
+
+Return one action, a list of them, or `null` / `[]` to carry on as you are.
+Mistakes never crash anything: they come back in the next observation's
+`feedback` (malformed actions) or `events` (`action_refused`, for actions the
+world said no to).
+
+### Driving an NPC from Python, or any other language
+
+Start the game with the agent bridge on:
+
+```bash
+godot --path . -- --agent-port=7777
+```
+
+Then, from `examples/agents/` (needs only Python 3, no packages):
+
+```python
+from planet_agent import run
+
+def decide(obs):
+    best = max(obs["surroundings"], key=lambda s: s["walkable"])
+    return [{"action": "move", "bearing": best["bearing"], "distance": best["walkable"]}]
+
+run(decide, name="my-bot")
+```
+
+`python wander_bot.py` is a ready-made version. The protocol is one JSON object
+per line over TCP (only reachable from this computer), so any language works.
+It is documented at the top of `agents/bridge/agent_bridge.gd`. Close the
+connection and the NPC disappears.
+
+### Letting Claude be the NPC's mind
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY=your-key-here      # Windows: set ANTHROPIC_API_KEY=your-key-here
+python examples/agents/claude_agent.py --persona "a grumpy old cartographer"
+```
+
+Each turn Claude reads the observation, thinks briefly, and replies with
+actions (and in-character speech). It decides about every 3 seconds of game
+time by default (`--think-every 60` ticks); each decision is one API call, so
+leave it running only as long as you want to pay for. Several can run at once,
+each in its own terminal, and they hear and answer each other.
+
+### Files
+
+- `agents/agent.gd`: the base class (observe, decide, act).
+- `agents/observation.gd`: builds what an agent perceives.
+- `agents/actions.gd`: the action list and how each becomes a command.
+- `agents/agent_runtime.gd`: runs agents after every tick, on the server.
+- `agents/examples/`: `patrol_agent.gd` (walks waypoints) and
+  `curious_agent.gd` (greets everything it meets, avoids water, rests at
+  night, answers when spoken to).
+- `agents/bridge/`: the TCP bridge for outside programs.
+- `examples/agents/`: Python client, a wander bot, and the Claude agent.
+
+Agents are deterministic when their own code is (the example agents seed their
+own random numbers), and a test checks that the same seed and the same agents
+give an identical world.

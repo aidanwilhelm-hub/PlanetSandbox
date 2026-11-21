@@ -67,8 +67,10 @@ func submit_command(cmd: Dictionary) -> void:
 func step() -> void:
 	events.clear()
 	# 1. Built-in brains look at the world and queue commands like anyone else.
+	#    A brain only runs while it is in control (an AI agent or player who
+	#    takes over a critter switches its brain off).
 	for e: Entity in entities.values():
-		if e.brain != "" and _brains.has(e.brain):
+		if e.brain != "" and _brains.has(e.brain) and e.controller == "brain:" + e.brain:
 			_pending.append_array(_brains[e.brain].think(self, e))
 	# 2. Apply every queued command, in the order received.
 	var queue := _pending
@@ -143,7 +145,16 @@ func _apply_command(cmd: Dictionary) -> String:
 				return "target is not land"
 			_spawn(kind, target, str(cmd.get("controller", "")))
 			return ""
-		Commands.DESPAWN, Commands.MOVE_TO, Commands.STOP:
+		Commands.ASSIGN:
+			if issuer != Commands.ADMIN:
+				return "only admin can assign entities"
+			var e := get_entity(int(cmd.get("entity_id", -1)))
+			if e == null:
+				return "no such entity"
+			e.controller = str(cmd.get("controller", ""))
+			_emit("entity_assigned", {"entity_id": e.id, "controller": e.controller})
+			return ""
+		Commands.DESPAWN, Commands.MOVE_TO, Commands.STOP, Commands.SAY:
 			var e := get_entity(int(cmd.get("entity_id", -1)))
 			if e == null:
 				return "no such entity"
@@ -155,6 +166,11 @@ func _apply_command(cmd: Dictionary) -> String:
 			elif type == Commands.STOP:
 				e.has_target = false
 				e.state = "idle"
+			elif type == Commands.SAY:
+				var text := str(cmd.get("text", "")).strip_edges()
+				if text == "":
+					return "nothing to say"
+				_emit("entity_said", {"entity_id": e.id, "text": text.left(Commands.MAX_SAY_LENGTH)})
 			else:
 				if not EntityKinds.KINDS[e.kind]["mobile"]:
 					return "entity %d can't move" % e.id
@@ -184,7 +200,7 @@ func _spawn(kind: String, dir: Vector3, controller: String = "") -> Entity:
 	elif e.brain != "":
 		e.controller = "brain:" + e.brain
 	entities[e.id] = e
-	_emit("entity_spawned", {"entity_id": e.id, "kind": kind})
+	_emit("entity_spawned", {"entity_id": e.id, "kind": kind, "controller": e.controller})
 	return e
 
 

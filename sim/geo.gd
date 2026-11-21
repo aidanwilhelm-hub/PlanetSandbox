@@ -49,3 +49,40 @@ static func random_dir_near(rng: RandomNumberGenerator, center: Vector3, max_ang
 	if axis.length_squared() < 1e-9:
 		axis = any_tangent(center)
 	return center.rotated(axis.normalized(), rng.randf_range(0.0, max_angle)).normalized()
+
+
+## Unit vector pointing north along the surface at `dir` (any tangent at the poles).
+static func north_at(dir: Vector3) -> Vector3:
+	var d := dir.normalized()
+	var n := Vector3.UP - d * d.y
+	if n.length_squared() < 1e-10:
+		return Vector3.FORWARD if d.y < 0.0 else Vector3.BACK
+	return n.normalized()
+
+
+## Compass bearing in degrees (0 = north, 90 = east) from `from` toward `to`.
+static func bearing_deg(from: Vector3, to: Vector3) -> float:
+	var f := from.normalized()
+	var t := to.normalized() - f * f.dot(to.normalized())
+	if t.length_squared() < 1e-14:
+		return 0.0
+	var north := north_at(f)
+	var east := north.cross(f)
+	return fposmod(rad_to_deg(atan2(t.dot(east), t.dot(north))), 360.0)
+
+
+## Compass bearing (degrees) of a tangent direction such as an entity's heading.
+static func heading_to_bearing_deg(at: Vector3, heading: Vector3) -> float:
+	var north := north_at(at)
+	var east := north.cross(at.normalized())
+	return fposmod(rad_to_deg(atan2(heading.dot(east), heading.dot(north))), 360.0)
+
+
+## Where you end up walking `angle` radians from `from` along compass `bearing`.
+static func destination(from: Vector3, bearing: float, angle: float) -> Vector3:
+	var f := from.normalized()
+	var north := north_at(f)
+	var east := north.cross(f)
+	var b := deg_to_rad(bearing)
+	var tangent := north * cos(b) + east * sin(b)
+	return (f * cos(angle) + tangent * sin(angle)).normalized()
